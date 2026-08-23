@@ -1,50 +1,66 @@
-# Welcome to your Expo app 👋
+# HydroMate 💧
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+**HydroMate** is an AI-assisted mobile application built with React Native and Expo to help users stay hydrated and manage everyday health reminders in one place.
 
-## Get started
+The project was designed, developed, tested, and iterated as a hands-on product build, with AI coding tools used to support feature planning, implementation, debugging, testing, and refinement.
 
-1. Install dependencies
+## Key Features
 
-   ```bash
-   npm install
-   ```
+- 💧 Daily water intake tracking
+- 🔔 Custom water reminder schedules
+- 💊 Medicine reminders with multiple reminder times
+- 🎂 Birthday reminders
+- ❤️ Anniversary reminders
+- ⏰ Custom reminders
+- ↩️ Undo accidental water entries
+- 📊 Water history, 7-day average, goal tracking, and streak analytics
+- 👤 User profile with personalized greeting
+- 📱 Firebase phone-number authentication
+- 💾 Persistent app settings and reminder data
+- 🌅 Dynamic greeting based on time of day
+- 🔕 Reminder Mode ON/OFF control
 
-2. Start the app
+## AI-Assisted Development
 
-   ```bash
-   npx expo start
-   ```
+AI coding tools were used throughout development for:
 
-In the output, you'll find options to open the app in a
+- Feature planning
+- React Native and TypeScript implementation
+- Debugging
+- Notification scheduling
+- UI improvements
+- Testing edge cases
+- Fixing data persistence issues
+- Iterative product improvements
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+## Tech Stack
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+- React Native
+- Expo / Expo Router
+- TypeScript
+- Firebase Authentication
+- AsyncStorage
+- Expo Notifications
+- EAS Build
+- Git & GitHub
 
-## Get a fresh project
+## Product Development Approach
 
-When you're ready, run:
+HydroMate was built as an end-to-end product project:
+
+1. Identified the user problem
+2. Defined product requirements
+3. Designed user flows
+4. Developed features incrementally
+5. Tested on real Android devices
+6. Debugged notification and persistence issues
+7. Improved UI and user experience
+8. Prepared Android development builds
+
+## Run Locally
 
 ```bash
-npm run reset-project
-```
-
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
-
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+git clone https://github.com/rohit384185-sudo/HydroMate1.git
+cd HydroMate1
+npm install
+npx expo start
