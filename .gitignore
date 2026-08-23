@@ -1,0 +1,17 @@
+node_modules/
+.expo/
+
+.env
+.env.*
+
+google-services.json
+
+*.jks
+*.keystore
+credentials.json
+
+.claude/
+
+.vscode/
+CLAUDE.md
+AGENTS.md
