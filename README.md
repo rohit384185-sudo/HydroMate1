@@ -5,7 +5,7 @@
 HydroMate is a mobile health companion designed and built end-to-end to help users manage hydration, medicines, routines, and important health-related reminders through a simple and voice-enabled experience.
 
 🎥 **Watch the 2.5-minute Product Demo:**  
-[Add Demo Video Link Here]
+[▶ Watch the HydroMate Product Demo](https://youtube.com/shorts/fuG_Lnh4kk0?feature=share)
 
 ---
 
@@ -49,7 +49,7 @@ Users can quickly add:
 
 An undo mechanism also protects against accidental entries.
 
-[HOME SCREENSHOT]
+<p align="center"><img src="docs/screenshots/home-dashboard.jpg" width="280" alt="HydroMate personalized home dashboard"> <img src="docs/screenshots/home-water-tracking.jpg" width="280" alt="HydroMate water tracking and hydration progress"></p>
 
 ---
 
@@ -67,7 +67,7 @@ Users can quickly see:
 
 This reduces unnecessary navigation and gives users a clear view of their day.
 
-[TODAY SCREENSHOT]
+<p align="center"><img src="docs/screenshots/today-timeline.jpg" width="280" alt="HydroMate Today timeline"></p>
 
 ---
 
@@ -83,7 +83,7 @@ HydroMate supports multiple reminder categories:
 
 Users can enable or disable individual categories while a Master Reminder controls the complete reminder system.
 
-[REMINDER SCREENSHOT]
+<p align="center"><img src="docs/screenshots/reminder-settings.jpg" width="280" alt="HydroMate reminder settings"></p>
 
 ---
 
@@ -124,7 +124,7 @@ Users can configure:
 - Custom duration
 - Ongoing medication
 
-[MEDICINE SCREENSHOT]
+<p align="center"><img src="docs/screenshots/medicine-reminder.jpg" width="280" alt="HydroMate medicine reminder setup"></p>
 
 ---
 
@@ -140,7 +140,7 @@ Users can:
 - Continue or update reminder plans
 - Manage recurring health routines
 
-[ASK HYDROMATE SCREENSHOT]
+> **Portfolio note:** Ask HydroMate is implemented and working; the UI is still being refined before adding a dedicated portfolio screenshot.
 
 ---
 
@@ -178,7 +178,7 @@ HydroMate can also:
 - Adjust voice-match sensitivity
 - Configure assistant response delay
 
-[VOICE & WAKE WORD SCREENSHOT]
+<p align="center"><img src="docs/screenshots/voice-wake-word.jpg" width="280" alt="HydroMate voice and Hey HydroMate wake word settings"></p>
 
 ---
 
@@ -295,6 +295,6 @@ It demonstrates my ability to:
 
 Product Manager | FinTech | AI & Digital Products
 
-LinkedIn: [Add LinkedIn Link]
+LinkedIn: [Rohit Sharma](https://www.linkedin.com/in/rohit-sharma-453207245/)
 
-Demo: [Add Demo Link]
+Demo: [▶ Watch the HydroMate Product Demo](https://youtube.com/shorts/fuG_Lnh4kk0?feature=share)
