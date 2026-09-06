@@ -4,9 +4,8 @@
 
 HydroMate is a mobile health companion designed and built end-to-end to help users manage hydration, medicines, routines, and important health-related reminders through a simple and voice-enabled experience.
 
-🎥 **Watch the 2.5-minute Product Demo:**  
-[▶ Watch the HydroMate Product Demo](https://youtube.com/shorts/fuG_Lnh4kk0?feature=share)
-
+🎥 **Watch the 4-minute Product Demo:**  
+[▶ Watch the HydroMate Product Demo](https://youtu.be/KVnqLkBYb90)
 ---
 
 ## 🚀 Why I Built HydroMate
@@ -297,4 +296,4 @@ Product Manager | FinTech | AI & Digital Products
 
 LinkedIn: [Rohit Sharma](https://www.linkedin.com/in/rohit-sharma-453207245/)
 
-Demo: [▶ Watch the HydroMate Product Demo](https://youtube.com/shorts/fuG_Lnh4kk0?feature=share)
+Demo: [▶ Watch the HydroMate Product Demo](https://youtu.be/KVnqLkBYb90)
