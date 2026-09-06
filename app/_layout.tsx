@@ -6,6 +6,8 @@ import { Image, View } from 'react-native';
 import 'react-native-reanimated';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
+import { LocalizationProvider } from '@/localization';
+import { VoiceReminderBridge } from '@/components/voice-reminder-bridge';
 
 export const unstable_settings = {
   anchor: '(tabs)',
@@ -37,12 +39,14 @@ if (showOpeningScreen) {
   );
 }
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        
-      </Stack>
-      <StatusBar style="auto" />
-    </ThemeProvider>
+    <LocalizationProvider>
+      <VoiceReminderBridge />
+      <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+        <Stack>
+          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+        </Stack>
+        <StatusBar style="auto" />
+      </ThemeProvider>
+    </LocalizationProvider>
   );
 }

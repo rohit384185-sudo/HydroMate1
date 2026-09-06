@@ -1,0 +1,29 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.hydromatewakeword'
+version = '0.1.0'
+
+android {
+  namespace 'expo.modules.hydromatewakeword'
+
+  defaultConfig {
+    versionCode 1
+    versionName '0.1.0'
+    consumerProguardFiles 'consumer-rules.pro'
+  }
+
+  sourceSets {
+    main {
+      // Package the validated source models without duplicating or rewriting them.
+      assets.srcDir file("${projectDir}/../../../assets/models")
+    }
+  }
+}
+
+dependencies {
+  // Inference-only Android runtime; no training or cloud dependency.
+  implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.29.0'
+}

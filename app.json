@@ -31,8 +31,16 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      "expo-localization",
       "expo-router",
       "expo-notifications",
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Allow HydroMate to use the microphone for speech features you explicitly start, including Listen and supported local wake-word detection.",
+          "speechRecognitionPermission": "Allow HydroMate to turn your spoken reminder into text."
+        }
+      ],
       [
         "expo-splash-screen",
         {

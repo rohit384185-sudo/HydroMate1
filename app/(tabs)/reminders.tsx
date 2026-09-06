@@ -1,5 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import React, { useEffect, useState } from "react";
+import { useFocusEffect } from "expo-router";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   Alert,
   SafeAreaView,
@@ -12,102 +13,333 @@ import {
   View,
 } from "react-native";
 import {
-  cancelAllHydroMateReminders,
+  cancelAllAnniversaryNotifications,
+  cancelAllBirthdayNotifications,
+  cancelAllCustomNotifications,
+  cancelAllMedicineNotifications,
+  cancelAnniversaryNotification,
+  cancelBirthdayNotification,
+  cancelCustomNotification,
+  getAnniversaryNotificationIdentifier,
+  getBirthdayNotificationIdentifier,
+  getCustomNotificationIdentifier,
   scheduleAnniversaryNotification,
   scheduleBirthdayNotification,
   scheduleCustomNotification,
-  scheduleMedicineNotification,
 } from "../../services/notificationService";
 import {
-  cancelWaterReminders,
   scheduleWaterReminders,
 } from "../../services/reminderService";
+import {
+  CATEGORY_ENABLED_KEYS,
+  getMasterReminderModeEnabled,
+  setReminderCategoryEnabled,
+  type ReminderCategory,
+} from "../../services/reminderCategoryService";
+import {
+  reconcileReminderCategory,
+  reconcileSavedReminderCategories,
+  loadReminderControlState,
+  setMasterReminderControlEnabled,
+} from "../../services/reminderControlService";
+import { useLocalization } from "../../localization";
+import { CompactTimePicker } from "../../components/compact-time-picker";
+import {
+  scheduleDatedReminderNotifications,
+  scheduleMedicineNotifications,
+  type DatedReminder,
+  type DatedReminderIdentifier,
+  type DatedReminderScheduler,
+  type HealthReminder,
+} from "../../services/savedReminderService";
+import {
+  getLocalDateKey,
+  getValidDurationDays,
+  parseLocalDateKey,
+} from "../../services/reminderDurationService";
 
 const REMINDER_SETTINGS_KEY =
   "hydromate-reminder-settings";
-  const HEALTH_REMINDERS_KEY = "hydromate-health-reminders";
-  const BIRTHDAY_REMINDERS_KEY = "hydromate-birthday-reminders";
-  const ANNIVERSARY_REMINDERS_KEY = "hydromate-anniversary-reminders";
-  const CUSTOM_REMINDERS_KEY = "hydromate-custom-reminders";
+const HEALTH_REMINDERS_KEY = "hydromate-health-reminders";
+const BIRTHDAY_REMINDERS_KEY = "hydromate-birthday-reminders";
+const ANNIVERSARY_REMINDERS_KEY = "hydromate-anniversary-reminders";
+const CUSTOM_REMINDERS_KEY = "hydromate-custom-reminders";
+const WATER_ENABLED_KEY = CATEGORY_ENABLED_KEYS.water;
+
+const MEDICINE_TYPE_OPTIONS = [
+  { value: "tablet", icon: "💊", labelKey: "reminders.tablet" },
+  { value: "cream", icon: "🧴", labelKey: "reminders.cream" },
+  { value: "drops", icon: "💧", labelKey: "reminders.drops" },
+  { value: "injection", icon: "💉", labelKey: "reminders.injection" },
+  { value: "other", icon: "🩹", labelKey: "reminders.other" },
+] as const;
+
+type DurationChoice = 1 | 3 | 5 | 7 | "custom" | "ongoing" | "legacy";
+
+const FINITE_DURATION_CHOICES = [1, 3, 5, 7] as const;
+
+type DurationSelectorProps = {
+  label: string;
+  choice: DurationChoice;
+  includeOngoing?: boolean;
+  customLabel: string;
+  ongoingLabel: string;
+  dayLabel: (days: number) => string;
+  onChange: (choice: DurationChoice) => void;
+};
+
+function DurationSelector({
+  label,
+  choice,
+  includeOngoing = false,
+  customLabel,
+  ongoingLabel,
+  dayLabel,
+  onChange,
+}: DurationSelectorProps) {
+  const options: { value: DurationChoice; label: string }[] = [
+    ...FINITE_DURATION_CHOICES.map((days) => ({
+      value: days,
+      label: dayLabel(days),
+    })),
+    { value: "custom", label: customLabel },
+    ...(includeOngoing
+      ? [{ value: "ongoing" as const, label: ongoingLabel }]
+      : []),
+  ];
+
+  return (
+    <View style={styles.durationSection}>
+      <Text style={styles.label}>{label}</Text>
+      <View style={styles.durationOptions}>
+        {options.map((option) => {
+          const selected = choice === option.value;
+          return (
+            <TouchableOpacity
+              key={String(option.value)}
+              accessibilityRole="button"
+              accessibilityState={{ selected }}
+              onPress={() => onChange(option.value)}
+              style={[
+                styles.durationOption,
+                selected && styles.durationOptionSelected,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.durationOptionText,
+                  selected && styles.durationOptionTextSelected,
+                ]}
+              >
+                {option.label}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+function getDurationChoice(durationDays?: number): DurationChoice {
+  if (durationDays === 1 || durationDays === 3 || durationDays === 5 || durationDays === 7) {
+    return durationDays;
+  }
+  return getValidDurationDays(durationDays) ? "custom" : "ongoing";
+}
+
+function resolveDurationDays(
+  choice: DurationChoice,
+  customValue: string
+) {
+  if (choice === "ongoing" || choice === "legacy") {
+    return undefined;
+  }
+
+  return choice === "custom"
+    ? getValidDurationDays(Number(customValue)) ?? null
+    : choice;
+}
+
+function getNextStartDateKey(day: number, month: number, now = new Date()) {
+  let year = now.getFullYear();
+  let date = new Date(year, month - 1, day, 0, 0, 0, 0);
+
+  if (date.getTime() < new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()) {
+    year += 1;
+    date = new Date(year, month - 1, day, 0, 0, 0, 0);
+  }
+
+  return getLocalDateKey(date);
+}
+
+const removeLeadingMedicineTypeIcon = (label: string, icon: string) =>
+  label.startsWith(icon) ? label.slice(icon.length).trimStart() : label;
+
+type CategoryReminderSwitchProps = {
+  label: string;
+  value: boolean;
+  onValueChange: (value: boolean) => void;
+};
+
+function CategoryReminderSwitch({
+  label,
+  value,
+  onValueChange,
+}: CategoryReminderSwitchProps) {
+  return (
+    <View style={styles.categorySwitchRow}>
+      <Text style={styles.categorySwitchLabel}>{label}</Text>
+      <Switch value={value} onValueChange={onValueChange} />
+    </View>
+  );
+}
+
+const getDatedReminderTime = (reminder: DatedReminder) => {
+  const [hour, minute] = reminder.time.split(":").map(Number);
+
+  if (
+    !Number.isInteger(hour) ||
+    !Number.isInteger(minute) ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59
+  ) {
+    return null;
+  }
+
+  return { hour, minute };
+};
+
+const cancelRemovedDatedReminderNotification = async (
+  removedReminder: DatedReminder,
+  remainingReminders: DatedReminder[],
+  reminderModeEnabled: boolean,
+  cancel: DatedReminderScheduler,
+  getIdentifier: DatedReminderIdentifier,
+  schedule: DatedReminderScheduler
+) => {
+  const removedTime = getDatedReminderTime(removedReminder);
+
+  if (!removedTime) {
+    return;
+  }
+
+  await cancel(
+    removedReminder.name,
+    removedReminder.month,
+    removedReminder.day,
+    removedTime.hour,
+    removedTime.minute
+  );
+
+  if (!reminderModeEnabled) {
+    return;
+  }
+
+  const removedIdentifier = getIdentifier(
+    removedReminder.name,
+    removedReminder.month,
+    removedReminder.day,
+    removedTime.hour,
+    removedTime.minute
+  );
+  const matchingReminder = remainingReminders.find((reminder) => {
+    const time = getDatedReminderTime(reminder);
+
+    return (
+      time !== null &&
+      getIdentifier(
+        reminder.name,
+        reminder.month,
+        reminder.day,
+        time.hour,
+        time.minute
+      ) === removedIdentifier
+    );
+  });
+
+  if (!matchingReminder) {
+    return;
+  }
+
+  const matchingTime = getDatedReminderTime(matchingReminder);
+
+  if (matchingTime) {
+    await schedule(
+      matchingReminder.name,
+      matchingReminder.month,
+      matchingReminder.day,
+      matchingTime.hour,
+      matchingTime.minute,
+      matchingReminder.durationDays,
+      matchingReminder.startDate
+    );
+  }
+};
+
 export default function RemindersScreen() {
+  const { t } = useLocalization();
   const [dailyGoal, setDailyGoal] = useState("4000");
   const [amount, setAmount] = useState("250");
   const [interval, setInterval] = useState("60");
   const [reminderCategory, setReminderCategory] = useState("water");
-const [medicineName, setMedicineName] = useState("");
-const [medicineNames, setMedicineNames] = useState<string[]>([]);
 const [newMedicineName, setNewMedicineName] = useState("");
 const [customReminderName, setCustomReminderName] = useState("");
 const [customReminderDay, setCustomReminderDay] = useState("");
 const [customReminderMonth, setCustomReminderMonth] = useState("");
 const [customReminderTime, setCustomReminderTime] = useState("09:00");
+const [routineDurationChoice, setRoutineDurationChoice] =
+  useState<DurationChoice>(1);
+const [routineCustomDurationDays, setRoutineCustomDurationDays] = useState("");
+const [routineStartDate, setRoutineStartDate] = useState<string>();
+const [showCustomReminderTimePicker, setShowCustomReminderTimePicker] =
+  useState(false);
 const [customRemindersLoaded, setCustomRemindersLoaded] = useState(false);
-const [customReminders, setCustomReminders] = useState<
-  {
-    name: string;
-    day: number;
-    month: number;
-    time: string;
-  }[]
->([]);
+const [customReminders, setCustomReminders] = useState<DatedReminder[]>([]);
 const [anniversaryName, setAnniversaryName] = useState("");
 const [anniversaryDay, setAnniversaryDay] = useState("");
-const [anniversaryReminders, setAnniversaryReminders] = useState<
-  {
-    name: string;
-    day: number;
-    month: number;
-    time: string;
-  }[]
->([]);
+const [anniversaryReminders, setAnniversaryReminders] =
+  useState<DatedReminder[]>([]);
 const [anniversaryRemindersLoaded, setAnniversaryRemindersLoaded] =
   useState(false);
 const [anniversaryMonth, setAnniversaryMonth] = useState("");
 const [anniversaryTime, setAnniversaryTime] = useState("09:00");
+const [showAnniversaryTimePicker, setShowAnniversaryTimePicker] =
+  useState(false);
 const [birthdayName, setBirthdayName] = useState("");
-const [birthdayDate, setBirthdayDate] = useState("");
 const [birthdayTime, setBirthdayTime] = useState("09:00");
+const [showBirthdayTimePicker, setShowBirthdayTimePicker] = useState(false);
 const [birthdayDay, setBirthdayDay] = useState("");
 const [birthdayMonth, setBirthdayMonth] = useState("");
-const [birthdayReminders, setBirthdayReminders] = useState<
-
-  {
-    name: string;
-    day: number;
-    month: number;
-    time: string;
-  }[]
->([]);
+const [birthdayReminders, setBirthdayReminders] =
+  useState<DatedReminder[]>([]);
 const [birthdayRemindersLoaded, setBirthdayRemindersLoaded] = useState(false);
 const [reminderModeEnabled, setReminderModeEnabled] = useState(true);
+const [medicineRemindersEnabled, setMedicineRemindersEnabled] = useState(true);
+const [birthdayRemindersEnabled, setBirthdayRemindersEnabled] = useState(true);
+const [anniversaryRemindersEnabled, setAnniversaryRemindersEnabled] =
+  useState(true);
+const [customRemindersEnabled, setCustomRemindersEnabled] = useState(true);
 const [healthReminderType, setHealthReminderType] = useState("tablet");
 const [newMedicineTimes, setNewMedicineTimes] = useState<string[]>([]);
 const [newMedicineTime, setNewMedicineTime] = useState("09:00");
+const [medicineDurationChoice, setMedicineDurationChoice] =
+  useState<DurationChoice>("ongoing");
+const [medicineCustomDurationDays, setMedicineCustomDurationDays] = useState("");
+const [medicineStartDate, setMedicineStartDate] = useState<string>();
 const [showMedicineTimePicker, setShowMedicineTimePicker] = useState(false);
-const [medicinePickerHour, setMedicinePickerHour] = useState(9);
-const [medicinePickerMinute, setMedicinePickerMinute] = useState(0);
-const [medicinePickerPeriod, setMedicinePickerPeriod] = useState<"AM" | "PM">("AM");
-const [healthReminders, setHealthReminders] = useState<
-
-
-  {
-  
-    name: string;
-    type: string;
-    times: string[];
-  }[]
->([]);
+const [healthReminders, setHealthReminders] = useState<HealthReminder[]>([]);
+const [editingMedicineIndex, setEditingMedicineIndex] = useState<number | null>(null);
+const [editingMedicineTimeIndex, setEditingMedicineTimeIndex] = useState<number | null>(null);
+const [editingBirthdayIndex, setEditingBirthdayIndex] = useState<number | null>(null);
+const [editingAnniversaryIndex, setEditingAnniversaryIndex] = useState<number | null>(null);
+const [editingCustomIndex, setEditingCustomIndex] = useState<number | null>(null);
 useEffect(() => {
   const loadReminderModeState = async () => {
     try {
-      const savedValue = await AsyncStorage.getItem(
-        "REMINDER_MODE_ENABLED"
-      );
-
-      if (savedValue !== null) {
-        const parsedValue = JSON.parse(savedValue);
-        setReminderModeEnabled(parsedValue);
-      }
+      setReminderModeEnabled(await getMasterReminderModeEnabled());
     } catch (error) {
       console.log("Error loading reminder mode state:", error);
     }
@@ -120,11 +352,12 @@ useEffect(() => {
   const loadHealthReminders = async () => {
     try {
       const saved = await AsyncStorage.getItem(HEALTH_REMINDERS_KEY);
+      const parsedReminders: HealthReminder[] = saved
+        ? JSON.parse(saved)
+        : [];
 
-      if (saved) {
-        const parsedReminders = JSON.parse(saved);
-        setHealthReminders(parsedReminders);
-      }
+      setHealthReminders(parsedReminders);
+
     } catch (error) {
       console.log("Failed to load health reminders:", error);
     } finally {
@@ -256,32 +489,61 @@ useEffect(() => {
   saveHealthReminders();
 }, [healthReminders, healthRemindersLoaded]);
   const [startHour, setStartHour] = useState("9");
+  const [startMinute, setStartMinute] = useState("0");
   const [endHour, setEndHour] = useState("21");
+  const [endMinute, setEndMinute] = useState("0");
   const [showStartPicker, setShowStartPicker] = useState(false);
 const [showEndPicker, setShowEndPicker] = useState(false);
   
 const [reminderMode, setReminderMode] =
   useState<"smart" | "fixed">("smart");
-  const [remindersEnabled, setRemindersEnabled] = useState(false);
-  const formatHour = (hour: number) => {
-  if (hour === 0) {
-    return "12:00 AM";
-  }
+const [remindersEnabled, setRemindersEnabled] = useState(true);
+useFocusEffect(
+  useCallback(() => {
+    let active = true;
+    void loadReminderControlState().then(({ masterEnabled, categories }) => {
+      if (!active) return;
+      setReminderModeEnabled(masterEnabled);
+      setRemindersEnabled(categories.water);
+      setMedicineRemindersEnabled(categories.medicine);
+      setBirthdayRemindersEnabled(categories.birthday);
+      setAnniversaryRemindersEnabled(categories.anniversary);
+      setCustomRemindersEnabled(categories.custom);
+    });
+    return () => {
+      active = false;
+    };
+  }, [])
+);
+useEffect(() => {
+  const reconcileSavedReminders = async () => {
+    try {
+      const masterEnabled = await getMasterReminderModeEnabled();
+      const categoryStates = await reconcileSavedReminderCategories(
+        masterEnabled
+      );
 
-  if (hour < 12) {
-    return `${hour}:00 AM`;
-  }
+      setReminderModeEnabled(masterEnabled);
+      setRemindersEnabled(categoryStates.water);
+      setMedicineRemindersEnabled(categoryStates.medicine);
+      setBirthdayRemindersEnabled(categoryStates.birthday);
+      setAnniversaryRemindersEnabled(categoryStates.anniversary);
+      setCustomRemindersEnabled(categoryStates.custom);
+    } catch (error) {
+      console.log("Could not reconcile saved reminder categories:", error);
+    }
+  };
 
-  if (hour === 12) {
-    return "12:00 PM";
-  }
-
-  return `${hour - 12}:00 PM`;
-};
+  void reconcileSavedReminders();
+}, []);
+  const getStartMinutes = () =>
+    Number(startHour) * 60 + Number(startMinute);
+  const getEndMinutes = () =>
+    Number(endHour) * 60 + Number(endMinute);
 
 const formatHealthTime = (time: string) => {
   if (!time) {
-    return "No time";
+    return t("reminders.noTime");
   }
 
   const cleanTime = time.trim().toLowerCase();
@@ -291,7 +553,7 @@ const formatHealthTime = (time: string) => {
   );
 
   if (!match) {
-    return "Invalid time";
+    return t("reminders.invalidTime");
   }
 
   let hour = Number(match[1]);
@@ -299,12 +561,12 @@ const formatHealthTime = (time: string) => {
   const typedPeriod = match[3];
 
   if (minute < 0 || minute > 59) {
-    return "Invalid time";
+    return t("reminders.invalidTime");
   }
 
   if (typedPeriod) {
     if (hour < 1 || hour > 12) {
-      return "Invalid time";
+      return t("reminders.invalidTime");
     }
 
     if (typedPeriod === "pm" && hour !== 12) {
@@ -316,11 +578,11 @@ const formatHealthTime = (time: string) => {
     }
   } else {
     if (hour < 0 || hour > 23) {
-      return "Invalid time";
+      return t("reminders.invalidTime");
     }
   }
 
-  const period = hour >= 12 ? "PM" : "AM";
+  const period = hour >= 12 ? t("common.pm") : t("common.am");
   const hour12 = hour % 12 || 12;
 
   return `${hour12}:${minute
@@ -338,7 +600,7 @@ const formatMinutesOfDay = (totalMinutes: number) => {
       ? hour - 12
       : hour;
 
-  const amPm = hour < 12 ? "AM" : "PM";
+  const amPm = hour < 12 ? t("common.am") : t("common.pm");
 
   return `${displayHour}:${String(minute).padStart(2, "0")} ${amPm}`;
 };
@@ -348,8 +610,8 @@ const getNextFixedReminderMinutes = () => {
   const currentMinutes =
     now.getHours() * 60 + now.getMinutes();
 
-  const start = Number(startHour) * 60;
-  const end = Number(endHour) * 60;
+  const start = getStartMinutes();
+  const end = getEndMinutes();
   const step = Number(interval);
 
   if (step <= 0 || end < start) {
@@ -370,8 +632,8 @@ const getNextFixedReminderMinutes = () => {
 };
 
 const getFixedScheduleTimes = () => {
-  const start = Number(startHour) * 60;
-  const end = Number(endHour) * 60;
+  const start = getStartMinutes();
+  const end = getEndMinutes();
   const step = Number(interval);
 
   if (step <= 0 || end < start) {
@@ -396,8 +658,8 @@ const getRemainingFixedReminders = () => {
   const currentMinutes =
     now.getHours() * 60 + now.getMinutes();
 
-  const start = Number(startHour) * 60;
-  const end = Number(endHour) * 60;
+  const start = getStartMinutes();
+  const end = getEndMinutes();
   const step = Number(interval);
 
   if (step <= 0 || end < start) {
@@ -443,8 +705,8 @@ const getRemainingFixedReminders = () => {
 const getSmartScheduleMinutes = () => {
   const goal = Number(dailyGoal);
   const perReminder = Number(amount);
-  const start = Number(startHour);
-  const end = Number(endHour);
+  const start = getStartMinutes();
+  const end = getEndMinutes();
 
   if (
     goal <= 0 ||
@@ -458,8 +720,8 @@ const getSmartScheduleMinutes = () => {
     goal / perReminder
   );
 
-  const startMinutes = start * 60;
-  const endMinutes = end * 60;
+  const startMinutes = start;
+  const endMinutes = end;
 
   const intervalMinutes =
     totalReminders === 1
@@ -487,8 +749,8 @@ const getSmartScheduleMinutes = () => {
 const getSmartScheduleTimes = () => {
   const goal = Number(dailyGoal);
   const perReminder = Number(amount);
-  const start = Number(startHour);
-  const end = Number(endHour);
+  const start = getStartMinutes();
+  const end = getEndMinutes();
 
   if (
     goal <= 0 ||
@@ -502,8 +764,8 @@ const getSmartScheduleTimes = () => {
     goal / perReminder
   );
 
-  const startMinutes = start * 60;
-  const endMinutes = end * 60;
+  const startMinutes = start;
+  const endMinutes = end;
 
   const intervalMinutes =
     totalReminders === 1
@@ -532,53 +794,6 @@ const getSmartScheduleTimes = () => {
 useEffect(() => {
   loadSavedSettings();
 }, []);
-const restoreSavedReminders = async () => {
-  for (const reminder of healthReminders) {
-    for (const time of reminder.times) {
-      const [hour, minute] = time.split(":").map(Number);
-
-      await scheduleMedicineNotification(
-        reminder.name,
-        hour,
-        minute
-      );
-    }
-  }
-
-  for (const birthday of birthdayReminders) {
-    const [hour, minute] = birthday.time.split(":").map(Number);
-
-    await scheduleBirthdayNotification(
-      birthday.name,
-      birthday.month,
-      birthday.day,
-      hour,
-      minute
-    );
-  }
-for (const anniversary of anniversaryReminders) {
-  const [hour, minute] = anniversary.time.split(":").map(Number);
-
-  await scheduleAnniversaryNotification(
-    anniversary.name,
-    anniversary.month,
-    anniversary.day,
-    hour,
-    minute
-  );
-}
-for (const customReminder of customReminders) {
-  const [hour, minute] = customReminder.time.split(":").map(Number);
-
-  await scheduleCustomNotification(
-    customReminder.name,
-    customReminder.month,
-    customReminder.day,
-    hour,
-    minute
-  );
-}
-};
 const loadSavedSettings = async () => {
   try {
     const savedSettings =
@@ -610,17 +825,27 @@ const loadSavedSettings = async () => {
       String(settings.startHour)
     );
 
+    setStartMinute(
+      String(settings.startMinute ?? 0)
+    );
+
     setEndHour(
       String(settings.endHour)
+    );
+
+    setEndMinute(
+      String(settings.endMinute ?? 0)
     );
     if (settings.mode === "smart" || settings.mode === "fixed") {
   setReminderMode(settings.mode);
 }
 const enabledValue = await AsyncStorage.getItem(
-  "hydromate-reminders-enabled"
+  WATER_ENABLED_KEY
 );
 
-setRemindersEnabled(enabledValue === "true");
+if (enabledValue !== null) {
+  setRemindersEnabled(enabledValue !== "false");
+}
   } catch (error) {
     console.log(
       "Could not load reminder settings:",
@@ -632,17 +857,29 @@ setRemindersEnabled(enabledValue === "true");
 const isFormValid =
   Number(dailyGoal) > 0 &&
   Number(amount) > 0 &&
-  Number(endHour) > Number(startHour) &&
+  Number.isInteger(Number(startHour)) &&
+  Number.isInteger(Number(startMinute)) &&
+  Number.isInteger(Number(endHour)) &&
+  Number.isInteger(Number(endMinute)) &&
+  Number(startHour) >= 0 &&
+  Number(startHour) <= 23 &&
+  Number(startMinute) >= 0 &&
+  Number(startMinute) <= 59 &&
+  Number(endHour) >= 0 &&
+  Number(endHour) <= 23 &&
+  Number(endMinute) >= 0 &&
+  Number(endMinute) <= 59 &&
+  getEndMinutes() > getStartMinutes() &&
   (
     reminderMode === "smart" ||
     Number(interval) > 0
   );
-  const enableReminders = async () => {
+  const saveWaterSettings = async () => {
   try {
-    if (Number(endHour) <= Number(startHour)) {
+    if (getEndMinutes() <= getStartMinutes()) {
   Alert.alert(
-    "Invalid Time",
-    "End time must be later than start time."
+    t("reminders.invalidTimeTitle"),
+    t("reminders.endAfterStart")
   );
   return;
 }
@@ -651,8 +888,8 @@ if (
   Number(amount) <= 0
 ) {
   Alert.alert(
-    "Invalid Amount",
-    "Daily goal and amount per reminder must be greater than 0."
+    t("reminders.invalidAmountTitle"),
+    t("reminders.invalidAmount")
   );
   return;
 }
@@ -661,8 +898,8 @@ if (
   Number(interval) <= 0
 ) {
   Alert.alert(
-    "Invalid Interval",
-    "Reminder interval must be greater than 0."
+    t("reminders.invalidIntervalTitle"),
+    t("reminders.invalidInterval")
   );
   return;
 }
@@ -671,7 +908,9 @@ if (
       amount: Number(amount),
       interval: Number(interval),
       startHour: Number(startHour),
+      startMinute: Number(startMinute),
       endHour: Number(endHour),
+      endMinute: Number(endMinute),
       mode: reminderMode,
     };
 
@@ -679,56 +918,144 @@ if (
       REMINDER_SETTINGS_KEY,
       JSON.stringify(settings)
     );
-await AsyncStorage.setItem(
-  "hydromate-reminders-enabled",
-  "true"
-);
+    if (!reminderModeEnabled || !remindersEnabled) {
+      Alert.alert("💧 HydroMate", t("reminders.waterSettingsSaved"));
+      return;
+    }
 
-setRemindersEnabled(true);
-    const result = await scheduleWaterReminders({
+    const schedulerSettings = {
       dailyGoal: settings.dailyGoal,
       amountPerReminder: settings.amount,
       intervalHours: settings.interval,
       startHour: settings.startHour,
+      startMinute: settings.startMinute,
       endHour: settings.endHour,
+      endMinute: settings.endMinute,
       mode: settings.mode,
-    });
+    };
+
+    const result = await scheduleWaterReminders(schedulerSettings);
 
     Alert.alert(
       "💧 HydroMate",
-      `${result.scheduledCount} reminders scheduled.\n\nTotal planned: ${result.scheduledAmount} ml`
+      t("reminders.scheduled", {
+        count: result.scheduledCount,
+        amount: result.scheduledAmount,
+      })
     );
   } catch (error) {
     Alert.alert(
-      "Something went wrong",
-      "Could not save or schedule your reminders."
+      t("reminders.somethingWrong"),
+      t("reminders.scheduleFailed")
     );
 
-    console.log("Reminder error:", error);
+    console.error("WATER SCHEDULING ERROR:", error);
   }
 };
-const disableReminders = async () => {
-  try {
-    await cancelWaterReminders();
+const updateCategoryEnabledState = (
+  category: ReminderCategory,
+  enabled: boolean
+) => {
+  if (category === "water") {
+    setRemindersEnabled(enabled);
+  } else if (category === "medicine") {
+    setMedicineRemindersEnabled(enabled);
+  } else if (category === "birthday") {
+    setBirthdayRemindersEnabled(enabled);
+  } else if (category === "anniversary") {
+    setAnniversaryRemindersEnabled(enabled);
+  } else {
+    setCustomRemindersEnabled(enabled);
+  }
+};
 
-    await AsyncStorage.setItem(
-      "hydromate-reminders-enabled",
-      "false"
-    );
+const toggleCategoryReminders = async (
+  category: ReminderCategory,
+  enabled: boolean
+) => {
+  updateCategoryEnabledState(category, enabled);
+  await setReminderCategoryEnabled(category, enabled);
+  await reconcileReminderCategory(category, enabled, reminderModeEnabled, {
+    medicine: healthReminders,
+    birthday: birthdayReminders,
+    anniversary: anniversaryReminders,
+    custom: customReminders,
+  });
+};
 
-    setRemindersEnabled(false);
+const resetMedicineForm = () => {
+  setNewMedicineName("");
+  setHealthReminderType("tablet");
+  setNewMedicineTime("09:00");
+  setNewMedicineTimes([]);
+  setMedicineDurationChoice("ongoing");
+  setMedicineCustomDurationDays("");
+  setMedicineStartDate(undefined);
+  setEditingMedicineIndex(null);
+  setEditingMedicineTimeIndex(null);
+  setShowMedicineTimePicker(false);
+};
 
-    Alert.alert(
-      "💧 HydroMate",
-      "Water reminders have been turned off."
-    );
-  } catch (error) {
-    Alert.alert(
-      "Error",
-      "Could not turn off reminders."
+const resetBirthdayForm = () => {
+  setBirthdayName("");
+  setBirthdayDay("");
+  setBirthdayMonth("");
+  setBirthdayTime("09:00");
+  setEditingBirthdayIndex(null);
+  setShowBirthdayTimePicker(false);
+};
+
+const resetAnniversaryForm = () => {
+  setAnniversaryName("");
+  setAnniversaryDay("");
+  setAnniversaryMonth("");
+  setAnniversaryTime("09:00");
+  setEditingAnniversaryIndex(null);
+  setShowAnniversaryTimePicker(false);
+};
+
+const resetCustomForm = () => {
+  setCustomReminderName("");
+  setCustomReminderDay("");
+  setCustomReminderMonth("");
+  setCustomReminderTime("09:00");
+  setRoutineDurationChoice(1);
+  setRoutineCustomDurationDays("");
+  setRoutineStartDate(undefined);
+  setEditingCustomIndex(null);
+  setShowCustomReminderTimePicker(false);
+};
+
+const saveDatedReminderList = async (
+  reminders: DatedReminder[],
+  storageKey: string,
+  enabled: boolean,
+  cancelAll: () => Promise<void>,
+  getIdentifier: DatedReminderIdentifier,
+  schedule: DatedReminderScheduler
+) => {
+  await cancelAll();
+  await AsyncStorage.setItem(storageKey, JSON.stringify(reminders));
+
+  if (reminderModeEnabled && enabled) {
+    await scheduleDatedReminderNotifications(
+      reminders,
+      getIdentifier,
+      schedule
     );
   }
 };
+
+const renderEditingControls = (onCancel: () => void) => (
+  <View style={styles.editingBanner}>
+    <Text style={styles.editingBannerText}>
+      {t("reminders.editingExisting")}
+    </Text>
+    <TouchableOpacity style={styles.cancelEditButton} onPress={onCancel}>
+      <Text style={styles.cancelEditText}>{t("common.cancelEdit")}</Text>
+    </TouchableOpacity>
+  </View>
+);
   return (
   <SafeAreaView style={styles.container}>
     <ScrollView
@@ -738,14 +1065,40 @@ const disableReminders = async () => {
       <View style={styles.content}>
 
         <Text style={styles.title}>
-          💧 Reminder Settings
+          {t("reminders.title")}
         </Text>
 
         <Text style={styles.subtitle}>
-          Choose when HydroMate should remind you.
+          {t("reminders.subtitle")}
         </Text>
+
+        <View style={styles.masterReminderRow}>
+          <View style={styles.masterReminderText}>
+            <Text style={styles.label}>{t("reminders.masterTitle")}</Text>
+            <Text style={styles.masterReminderSubtitle}>
+              {t("reminders.masterControlsAll")}
+            </Text>
+            <Text style={styles.masterReminderState}>
+              {t(reminderModeEnabled ? "reminders.on" : "reminders.off")}
+            </Text>
+          </View>
+          <Switch
+            value={reminderModeEnabled}
+            onValueChange={async (value) => {
+              setReminderModeEnabled(value);
+              const categoryStates = await setMasterReminderControlEnabled(value);
+              setRemindersEnabled(categoryStates.water);
+              setMedicineRemindersEnabled(categoryStates.medicine);
+              setBirthdayRemindersEnabled(categoryStates.birthday);
+              setAnniversaryRemindersEnabled(categoryStates.anniversary);
+              setCustomRemindersEnabled(categoryStates.custom);
+              alert(t(value ? "reminders.savedOn" : "reminders.allOff"));
+            }}
+          />
+        </View>
+
         <Text style={styles.label}>
-  Reminder Type
+  {t("reminders.type")}
 </Text>
 
 <View
@@ -758,75 +1111,56 @@ const disableReminders = async () => {
 >
   <TouchableOpacity
   onPress={() => setReminderCategory("water")}
-  style={{
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      reminderCategory === "water" ? "#dff3ff" : "transparent",
-  }}
+  style={[
+    styles.reminderTypeButton,
+    reminderCategory === "water" && styles.reminderTypeButtonActive,
+  ]}
 >
-  <Text>💧 Water</Text>
+  <Text style={styles.reminderTypeIcon}>💧</Text>
+  <Text style={styles.reminderTypeLabel}>{t("reminders.water")}</Text>
 </TouchableOpacity>
 
 <TouchableOpacity
   onPress={() => setReminderCategory("medicine")}
-  style={{
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      reminderCategory === "medicine" ? "#dff3ff" : "transparent",
-  }}
+  style={[
+    styles.reminderTypeButton,
+    reminderCategory === "medicine" && styles.reminderTypeButtonActive,
+  ]}
 >
-  <Text>💊 Medicine</Text>
+  <Text style={styles.reminderTypeIcon}>💊</Text>
+  <Text style={styles.reminderTypeLabel}>{t("reminders.medicine")}</Text>
 </TouchableOpacity>
 
   <TouchableOpacity
     onPress={() => setReminderCategory("birthday")}
-    style={{
-      paddingVertical: 10,
-      paddingHorizontal: 14,
-      borderRadius: 10,
-      borderWidth: 1,
-      backgroundColor:
-        reminderCategory === "birthday" ? "#dff3ff" : "transparent",
-    }}
+    style={[
+      styles.reminderTypeButton,
+      reminderCategory === "birthday" && styles.reminderTypeButtonActive,
+    ]}
   >
-    <Text>🎂 Birthday</Text>
+    <Text style={styles.reminderTypeIcon}>🎂</Text>
+    <Text style={styles.reminderTypeLabel}>{t("reminders.birthday")}</Text>
   </TouchableOpacity>
 
   <TouchableOpacity
   onPress={() => setReminderCategory("anniversary")}
-  style={{
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      reminderCategory === "anniversary"
-        ? "#dff3ff"
-        : "transparent",
-  }}
+  style={[
+    styles.reminderTypeButton,
+    reminderCategory === "anniversary" && styles.reminderTypeButtonActive,
+  ]}
 >
-  <Text>💍 Anniversary</Text>
+  <Text style={styles.reminderTypeIcon}>💍</Text>
+  <Text style={styles.reminderTypeLabel}>{t("reminders.anniversary")}</Text>
   </TouchableOpacity>
 <TouchableOpacity
   onPress={() => setReminderCategory("custom")}
-  style={{
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      reminderCategory === "custom"
-        ? "#dff3ff"
-        : "transparent",
-  }}
+  style={[
+    styles.reminderTypeButton,
+    reminderCategory === "custom" && styles.reminderTypeButtonActive,
+  ]}
 >
-  <Text>📝 Custom</Text>
+  <Text style={styles.reminderTypeIcon}>📝</Text>
+  <Text style={styles.reminderTypeLabel}>{t("reminders.routine")}</Text>
 </TouchableOpacity>
 </View>
 {reminderCategory === "birthday" ? (
@@ -837,17 +1171,27 @@ const disableReminders = async () => {
       marginBottom: 20,
     }}
   >
-    <Text style={styles.label}>Birthday Name</Text>
+    <CategoryReminderSwitch
+      label={t("reminders.enableBirthdayReminders")}
+      value={birthdayRemindersEnabled}
+      onValueChange={(value) => {
+        void toggleCategoryReminders("birthday", value);
+      }}
+    />
+    {editingBirthdayIndex !== null
+      ? renderEditingControls(resetBirthdayForm)
+      : null}
+    <Text style={styles.label}>{t("reminders.birthdayName")}</Text>
 
     <TextInput
       style={styles.input}
       value={birthdayName}
       onChangeText={setBirthdayName}
-      placeholder="e.g. Rohit"
+      placeholder={t("reminders.birthdayExample")}
     />
 
     <Text style={[styles.label, { marginTop: 16 }]}>
-      Birthday Date
+      {t("reminders.birthdayDate")}
     </Text>
 
     <View
@@ -873,6 +1217,137 @@ const disableReminders = async () => {
     keyboardType="numeric"
     maxLength={2}
   />
+
+</View>
+
+    <Text style={[styles.label, { marginTop: 16 }]}>
+      {t("reminders.reminderTime")}
+    </Text>
+
+    <TouchableOpacity
+      style={styles.addTimeButton}
+      onPress={() => setShowBirthdayTimePicker(true)}
+    >
+      <Text style={styles.addTimeButtonText}>
+        + {t("reminders.addTime")}
+      </Text>
+    </TouchableOpacity>
+    {birthdayTime ? (
+      <View style={styles.selectedTimesList}>
+        <View style={styles.selectedTimeRow}>
+          <View style={styles.selectedTimeContent}>
+            <Text style={styles.selectedTimeIcon}>⏰</Text>
+            <Text style={styles.selectedTimeText}>
+              {formatHealthTime(birthdayTime)}
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.selectedTimeRemoveButton}
+            onPress={() => setBirthdayTime("")}
+          >
+            <Text style={styles.selectedTimeRemoveText}>
+              {t("common.remove")}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    ) : null}
+    <CompactTimePicker
+      visible={showBirthdayTimePicker}
+      value={birthdayTime}
+      onCancel={() => setShowBirthdayTimePicker(false)}
+      onDone={(time) => {
+        setBirthdayTime(time);
+        setShowBirthdayTimePicker(false);
+      }}
+    />
+
+    <TouchableOpacity
+      onPress={async () => {
+        if (!birthdayName.trim()) {
+          alert(t("reminders.enterBirthdayName"));
+          return;
+        }
+
+        const day = Number(birthdayDay);
+const month = Number(birthdayMonth);
+        const [hour, minute] = birthdayTime.split(":").map(Number);
+
+        if (
+          !day ||
+          !month ||
+          day < 1 ||
+          day > 31 ||
+          month < 1 ||
+          month > 12
+        ) {
+          alert(t("reminders.enterBirthdayDate"));
+          return;
+        }
+
+        if (
+          !birthdayTime ||
+          !Number.isInteger(hour) ||
+          !Number.isInteger(minute) ||
+          hour < 0 ||
+          hour > 23 ||
+          minute < 0 ||
+          minute > 59
+        ) {
+          alert(t("reminders.enterTime"));
+          return;
+        }
+
+        const reminder = {
+          name: birthdayName.trim(),
+          day,
+          month,
+          time: birthdayTime,
+        };
+        const updatedReminders = editingBirthdayIndex === null
+          ? [...birthdayReminders, reminder]
+          : birthdayReminders.map((item, index) =>
+              index === editingBirthdayIndex ? reminder : item
+            );
+
+        await saveDatedReminderList(
+          updatedReminders,
+          BIRTHDAY_REMINDERS_KEY,
+          birthdayRemindersEnabled,
+          cancelAllBirthdayNotifications,
+          getBirthdayNotificationIdentifier,
+          scheduleBirthdayNotification
+        );
+        setBirthdayReminders(updatedReminders);
+        if (editingBirthdayIndex === null) {
+          alert(t("reminders.birthdayAdded"));
+        }
+        resetBirthdayForm();
+      }}
+      style={{
+        alignSelf: "center",
+        marginTop: 18,
+        paddingVertical: 10,
+        paddingHorizontal: 24,
+        borderRadius: 12,
+        backgroundColor: "#2196F3",
+        alignItems: "center",
+        justifyContent: "center",
+      }}
+    >
+      <Text
+        style={{
+          fontSize: 18,
+          fontWeight: "700",
+          textAlign: "center",
+        }}
+      >
+        {t(editingBirthdayIndex === null
+          ? "reminders.addBirthday"
+          : "reminders.updateBirthday")}
+      </Text>
+    </TouchableOpacity>
+
   {birthdayReminders.length > 0 && (
   <View
     style={{
@@ -885,25 +1360,15 @@ const disableReminders = async () => {
         { marginBottom: 10 },
       ]}
     >
-      Saved Birthdays
+      {t("reminders.savedBirthdays")}
     </Text>
 
     {birthdayReminders.map((birthday, index) => (
       <View
         key={`${birthday.name}-${birthday.day}-${birthday.month}-${index}`}
-        style={{
-          padding: 14,
-          marginBottom: 10,
-          borderRadius: 12,
-          backgroundColor: "#F5F7FA",
-        }}
+        style={styles.savedReminderCard}
       >
-        <Text
-          style={{
-            fontSize: 17,
-            fontWeight: "700",
-          }}
-        >
+        <Text style={styles.savedCardTitle}>
           🎂 {birthday.name}
         </Text>
 
@@ -925,127 +1390,52 @@ const disableReminders = async () => {
         >
           ⏰ {birthday.time}
       </Text>
-      <TouchableOpacity
-  onPress={() => {
-    setBirthdayReminders((prev) =>
-      prev.filter((_, itemIndex) => itemIndex !== index)
-    );
-  }}
-  style={{
-    marginTop: 10,
-    alignSelf: "flex-start",
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    backgroundColor: "#E53935",
-  }}
->
-  <Text
-    style={{
-      fontSize: 14,
-      fontWeight: "700",
-      color: "#FFFFFF",
-    }}
-  >
-    Remove
-  </Text>
-</TouchableOpacity>
+      <View style={styles.savedCardActions}>
+        <TouchableOpacity
+          style={styles.editActionButton}
+          onPress={() => {
+            setEditingBirthdayIndex(index);
+            setBirthdayName(birthday.name);
+            setBirthdayDay(String(birthday.day));
+            setBirthdayMonth(String(birthday.month));
+            setBirthdayTime(birthday.time);
+          }}
+        >
+          <Text style={styles.editActionText}>{t("common.edit")}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.removeActionButton}
+          onPress={async () => {
+            const updatedReminders = birthdayReminders.filter(
+              (_, itemIndex) => itemIndex !== index
+            );
+
+            await cancelRemovedDatedReminderNotification(
+              birthday,
+              updatedReminders,
+              reminderModeEnabled && birthdayRemindersEnabled,
+              cancelBirthdayNotification,
+              getBirthdayNotificationIdentifier,
+              scheduleBirthdayNotification
+            );
+            await AsyncStorage.setItem(
+              BIRTHDAY_REMINDERS_KEY,
+              JSON.stringify(updatedReminders)
+            );
+            setBirthdayReminders(updatedReminders);
+            if (editingBirthdayIndex === index) resetBirthdayForm();
+            else if (editingBirthdayIndex !== null && editingBirthdayIndex > index) {
+              setEditingBirthdayIndex(editingBirthdayIndex - 1);
+            }
+          }}
+        >
+          <Text style={styles.removeActionText}>{t("common.remove")}</Text>
+        </TouchableOpacity>
+      </View>
       </View>
     ))}
   </View>
 )}
-</View>
-
-    <Text style={[styles.label, { marginTop: 16 }]}>
-      Reminder Time
-    </Text>
-
-    <TextInput
-      style={styles.input}
-      value={birthdayTime}
-      onChangeText={setBirthdayTime}
-      placeholder="09:00"
-      keyboardType="numeric"
-    />
-
-    <TouchableOpacity
-      onPress={async () => {
-        if (!birthdayName.trim()) {
-          alert("Please enter birthday name");
-          return;
-        }
-
-        const day = Number(birthdayDay);
-const month = Number(birthdayMonth);
-        const [hour, minute] = birthdayTime.split(":").map(Number);
-
-        if (
-          !day ||
-          !month ||
-          day < 1 ||
-          day > 31 ||
-          month < 1 ||
-          month > 12
-        ) {
-          alert("Please enter birthday date as DD/MM");
-          return;
-        }
-
-        if (
-          Number.isNaN(hour) ||
-          Number.isNaN(minute) ||
-          hour < 0 ||
-          hour > 23 ||
-          minute < 0 ||
-          minute > 59
-        ) {
-          alert("Please enter time as HH:MM");
-          return;
-        }
-
-        await scheduleBirthdayNotification(
-          birthdayName.trim(),
-          month,
-          day,
-          hour,
-          minute
-        );
-setBirthdayReminders((prev) => [
-  ...prev,
-  {
-    name: birthdayName.trim(),
-    day,
-    month,
-    time: birthdayTime,
-  },
-]);
-        alert("Birthday reminder added");
-        setBirthdayName("");
-setBirthdayDay("");
-setBirthdayMonth("");
-setBirthdayTime("09:00");
-      }}
-      style={{
-        alignSelf: "center",
-        marginTop: 18,
-        paddingVertical: 10,
-        paddingHorizontal: 24,
-        borderRadius: 12,
-        backgroundColor: "#2196F3",
-        alignItems: "center",
-        justifyContent: "center",
-      }}
-    >
-      <Text
-        style={{
-          fontSize: 18,
-          fontWeight: "700",
-          textAlign: "center",
-        }}
-      >
-        🎂 Add Birthday
-      </Text>
-    </TouchableOpacity>
   </View>
 ) : null}
 {reminderCategory === "anniversary" ? (
@@ -1055,17 +1445,27 @@ setBirthdayTime("09:00");
       marginBottom: 20,
     }}
   >
-    <Text style={styles.label}>Anniversary Name</Text>
+    <CategoryReminderSwitch
+      label={t("reminders.enableAnniversaryReminders")}
+      value={anniversaryRemindersEnabled}
+      onValueChange={(value) => {
+        void toggleCategoryReminders("anniversary", value);
+      }}
+    />
+    {editingAnniversaryIndex !== null
+      ? renderEditingControls(resetAnniversaryForm)
+      : null}
+    <Text style={styles.label}>{t("reminders.anniversaryName")}</Text>
 
     <TextInput
       style={styles.input}
       value={anniversaryName}
       onChangeText={setAnniversaryName}
-      placeholder="e.g. Rohit & Aakriti"
+      placeholder={t("reminders.anniversaryExample")}
     />
 
     <Text style={[styles.label, { marginTop: 16 }]}>
-      Anniversary Date
+      {t("reminders.anniversaryDate")}
     </Text>
 
     <View
@@ -1094,20 +1494,50 @@ setBirthdayTime("09:00");
     </View>
 
     <Text style={[styles.label, { marginTop: 16 }]}>
-      Reminder Time
+      {t("reminders.reminderTime")}
     </Text>
 
-    <TextInput
-      style={styles.input}
+    <TouchableOpacity
+      style={styles.addTimeButton}
+      onPress={() => setShowAnniversaryTimePicker(true)}
+    >
+      <Text style={styles.addTimeButtonText}>
+        + {t("reminders.addTime")}
+      </Text>
+    </TouchableOpacity>
+    {anniversaryTime ? (
+      <View style={styles.selectedTimesList}>
+        <View style={styles.selectedTimeRow}>
+          <View style={styles.selectedTimeContent}>
+            <Text style={styles.selectedTimeIcon}>⏰</Text>
+            <Text style={styles.selectedTimeText}>
+              {formatHealthTime(anniversaryTime)}
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.selectedTimeRemoveButton}
+            onPress={() => setAnniversaryTime("")}
+          >
+            <Text style={styles.selectedTimeRemoveText}>
+              {t("common.remove")}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    ) : null}
+    <CompactTimePicker
+      visible={showAnniversaryTimePicker}
       value={anniversaryTime}
-      onChangeText={setAnniversaryTime}
-      placeholder="09:00"
-      keyboardType="numeric"
+      onCancel={() => setShowAnniversaryTimePicker(false)}
+      onDone={(time) => {
+        setAnniversaryTime(time);
+        setShowAnniversaryTimePicker(false);
+      }}
     />
     <TouchableOpacity
   onPress={async () => {
     if (!anniversaryName.trim()) {
-      alert("Please enter anniversary name");
+      alert(t("reminders.enterAnniversaryName"));
       return;
     }
 
@@ -1124,46 +1554,51 @@ setBirthdayTime("09:00");
       day < 1 ||
       day > 31 ||
       month < 1 ||
-      month > 12
+      month > 12 ||
+      new Date(2024, month - 1, day).getMonth() !== month - 1
     ) {
-      alert("Please enter a valid anniversary date");
+      alert(t("reminders.invalidAnniversaryDate"));
       return;
     }
 
     if (
-      Number.isNaN(hour) ||
-      Number.isNaN(minute) ||
+      !anniversaryTime ||
+      !Number.isInteger(hour) ||
+      !Number.isInteger(minute) ||
       hour < 0 ||
       hour > 23 ||
       minute < 0 ||
       minute > 59
     ) {
-      alert("Please enter time as HH:MM");
+      alert(t("reminders.enterTime"));
       return;
     }
 
-    await scheduleAnniversaryNotification(
-      anniversaryName.trim(),
-      month,
+    const reminder = {
+      name: anniversaryName.trim(),
       day,
-      hour,
-      minute
-    );
-setAnniversaryReminders((prev) => [
-  ...prev,
-  {
-    name: anniversaryName.trim(),
-    day,
-    month,
-    time: anniversaryTime,
-  },
-]);
-    alert("Anniversary reminder added");
+      month,
+      time: anniversaryTime,
+    };
+    const updatedReminders = editingAnniversaryIndex === null
+      ? [...anniversaryReminders, reminder]
+      : anniversaryReminders.map((item, index) =>
+          index === editingAnniversaryIndex ? reminder : item
+        );
 
-    setAnniversaryName("");
-    setAnniversaryDay("");
-    setAnniversaryMonth("");
-    setAnniversaryTime("09:00");
+    await saveDatedReminderList(
+      updatedReminders,
+      ANNIVERSARY_REMINDERS_KEY,
+      anniversaryRemindersEnabled,
+      cancelAllAnniversaryNotifications,
+      getAnniversaryNotificationIdentifier,
+      scheduleAnniversaryNotification
+    );
+    setAnniversaryReminders(updatedReminders);
+    if (editingAnniversaryIndex === null) {
+      alert(t("reminders.anniversaryAdded"));
+    }
+    resetAnniversaryForm();
   }}
   style={{
     alignSelf: "center",
@@ -1183,7 +1618,9 @@ setAnniversaryReminders((prev) => [
       textAlign: "center",
     }}
   >
-    💍 Add Anniversary
+    {t(editingAnniversaryIndex === null
+      ? "reminders.addAnniversary"
+      : "reminders.updateAnniversary")}
     </Text>
 </TouchableOpacity>
     {anniversaryReminders.length > 0 && (
@@ -1198,25 +1635,15 @@ setAnniversaryReminders((prev) => [
         { marginBottom: 10 },
       ]}
     >
-      Saved Anniversaries
+      {t("reminders.savedAnniversaries")}
     </Text>
 
     {anniversaryReminders.map((anniversary, index) => (
       <View
         key={`${anniversary.name}-${anniversary.day}-${anniversary.month}-${index}`}
-        style={{
-          padding: 14,
-          marginBottom: 10,
-          borderRadius: 12,
-          backgroundColor: "#F5F7FA",
-        }}
+        style={styles.savedReminderCard}
       >
-        <Text
-          style={{
-            fontSize: 17,
-            fontWeight: "700",
-          }}
-        >
+        <Text style={styles.savedCardTitle}>
           💍 {anniversary.name}
         </Text>
 
@@ -1238,31 +1665,51 @@ setAnniversaryReminders((prev) => [
         >
           ⏰ {anniversary.time}
         </Text>
-        <TouchableOpacity
-  onPress={() => {
-    setAnniversaryReminders((prev) =>
-      prev.filter((_, itemIndex) => itemIndex !== index)
-    );
-  }}
-  style={{
-    marginTop: 10,
-    alignSelf: "flex-start",
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    backgroundColor: "#E53935",
-  }}
->
-  <Text
-    style={{
-      fontSize: 14,
-      fontWeight: "700",
-      color: "#FFFFFF",
-    }}
-  >
-    Remove
-  </Text>
-</TouchableOpacity>
+        <View style={styles.savedCardActions}>
+          <TouchableOpacity
+            style={styles.editActionButton}
+            onPress={() => {
+              setEditingAnniversaryIndex(index);
+              setAnniversaryName(anniversary.name);
+              setAnniversaryDay(String(anniversary.day));
+              setAnniversaryMonth(String(anniversary.month));
+              setAnniversaryTime(anniversary.time);
+            }}
+          >
+            <Text style={styles.editActionText}>{t("common.edit")}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.removeActionButton}
+            onPress={async () => {
+              const updatedReminders = anniversaryReminders.filter(
+                (_, itemIndex) => itemIndex !== index
+              );
+
+              await cancelRemovedDatedReminderNotification(
+                anniversary,
+                updatedReminders,
+                reminderModeEnabled && anniversaryRemindersEnabled,
+                cancelAnniversaryNotification,
+                getAnniversaryNotificationIdentifier,
+                scheduleAnniversaryNotification
+              );
+              await AsyncStorage.setItem(
+                ANNIVERSARY_REMINDERS_KEY,
+                JSON.stringify(updatedReminders)
+              );
+              setAnniversaryReminders(updatedReminders);
+              if (editingAnniversaryIndex === index) resetAnniversaryForm();
+              else if (
+                editingAnniversaryIndex !== null &&
+                editingAnniversaryIndex > index
+              ) {
+                setEditingAnniversaryIndex(editingAnniversaryIndex - 1);
+              }
+            }}
+          >
+            <Text style={styles.removeActionText}>{t("common.remove")}</Text>
+          </TouchableOpacity>
+        </View>
       </View>
     ))}
   </View>
@@ -1276,17 +1723,27 @@ setAnniversaryReminders((prev) => [
       marginBottom: 20,
     }}
   >
-    <Text style={styles.label}>Custom Reminder Name</Text>
+    <CategoryReminderSwitch
+      label={t("reminders.enableRoutineReminders")}
+      value={customRemindersEnabled}
+      onValueChange={(value) => {
+        void toggleCategoryReminders("custom", value);
+      }}
+    />
+    {editingCustomIndex !== null
+      ? renderEditingControls(resetCustomForm)
+      : null}
+    <Text style={styles.label}>{t("reminders.routineName")}</Text>
 
     <TextInput
       style={styles.input}
       value={customReminderName}
       onChangeText={setCustomReminderName}
-      placeholder="e.g. Call Doctor"
+      placeholder={t("reminders.routineExample")}
     />
 
     <Text style={[styles.label, { marginTop: 16 }]}>
-      Reminder Date
+      {t("reminders.startDate")}
     </Text>
 
     <View
@@ -1315,20 +1772,83 @@ setAnniversaryReminders((prev) => [
     </View>
 
     <Text style={[styles.label, { marginTop: 16 }]}>
-      Reminder Time
+      {t("reminders.reminderTime")}
     </Text>
 
-    <TextInput
-      style={styles.input}
+    <TouchableOpacity
+      style={styles.addTimeButton}
+      onPress={() => setShowCustomReminderTimePicker(true)}
+    >
+      <Text style={styles.addTimeButtonText}>
+        + {t("reminders.addTime")}
+      </Text>
+    </TouchableOpacity>
+    {customReminderTime ? (
+      <View style={styles.selectedTimesList}>
+        <View style={styles.selectedTimeRow}>
+          <View style={styles.selectedTimeContent}>
+            <Text style={styles.selectedTimeIcon}>⏰</Text>
+            <Text style={styles.selectedTimeText}>
+              {formatHealthTime(customReminderTime)}
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.selectedTimeRemoveButton}
+            onPress={() => setCustomReminderTime("")}
+          >
+            <Text style={styles.selectedTimeRemoveText}>
+              {t("common.remove")}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    ) : null}
+    <CompactTimePicker
+      visible={showCustomReminderTimePicker}
       value={customReminderTime}
-      onChangeText={setCustomReminderTime}
-      placeholder="09:00"
-      keyboardType="numeric"
+      onCancel={() => setShowCustomReminderTimePicker(false)}
+      onDone={(time) => {
+        setCustomReminderTime(time);
+        setShowCustomReminderTimePicker(false);
+      }}
     />
+    <DurationSelector
+      label={t("reminders.duration")}
+      choice={routineDurationChoice}
+      customLabel={t("reminders.customDuration")}
+      ongoingLabel={t("reminders.ongoing")}
+      dayLabel={(days) =>
+        t(
+          days === 1
+            ? "reminders.oneDay"
+            : days === 3
+              ? "reminders.threeDays"
+              : days === 5
+                ? "reminders.fiveDays"
+                : "reminders.sevenDays"
+        )
+      }
+      onChange={(choice) => {
+        setRoutineDurationChoice(choice);
+        if (choice !== "custom") setRoutineCustomDurationDays("");
+      }}
+    />
+    {routineDurationChoice === "custom" ? (
+      <TextInput
+        style={styles.input}
+        value={routineCustomDurationDays}
+        onChangeText={setRoutineCustomDurationDays}
+        placeholder={t("reminders.durationDaysPlaceholder")}
+        keyboardType="number-pad"
+      />
+    ) : null}
+    {routineDurationChoice === "legacy" ? (
+      <Text style={styles.durationHelp}>{t("reminders.legacyRoutineHelp")}</Text>
+    ) : null}
     <TouchableOpacity
   onPress={async () => {
     if (!customReminderName.trim()) {
-      alert("Please enter reminder name");
+      alert(t("reminders.enterReminderName"));
       return;
     }
 
@@ -1345,47 +1865,71 @@ setAnniversaryReminders((prev) => [
       day < 1 ||
       day > 31 ||
       month < 1 ||
-      month > 12
+      month > 12 ||
+      new Date(2024, month - 1, day).getMonth() !== month - 1
     ) {
-      alert("Please enter a valid date");
+      alert(t("reminders.invalidDate"));
       return;
     }
 
     if (
-      Number.isNaN(hour) ||
-      Number.isNaN(minute) ||
+      !customReminderTime ||
+      !Number.isInteger(hour) ||
+      !Number.isInteger(minute) ||
       hour < 0 ||
       hour > 23 ||
       minute < 0 ||
       minute > 59
     ) {
-      alert("Please enter time as HH:MM");
+      alert(t("reminders.enterTime"));
       return;
     }
 
-    await scheduleCustomNotification(
-      customReminderName.trim(),
-      month,
-      day,
-      hour,
-      minute
+    const durationDays = resolveDurationDays(
+      routineDurationChoice,
+      routineCustomDurationDays
     );
-    setCustomReminders((prev) => [
-  ...prev,
-  {
-    name: customReminderName.trim(),
-    day,
-    month,
-    time: customReminderTime,
-  },
-]);
 
-    alert("Custom reminder added");
+    if (durationDays === null) {
+      alert(t("reminders.invalidDuration"));
+      return;
+    }
 
-    setCustomReminderName("");
-    setCustomReminderDay("");
-    setCustomReminderMonth("");
-    setCustomReminderTime("09:00");
+    const storedStartDate = parseLocalDateKey(routineStartDate);
+    const startDate = durationDays
+      ? storedStartDate &&
+        storedStartDate.getDate() === day &&
+        storedStartDate.getMonth() + 1 === month
+        ? routineStartDate
+        : getNextStartDateKey(day, month)
+      : undefined;
+    const reminder: DatedReminder = {
+      name: customReminderName.trim(),
+      day,
+      month,
+      time: customReminderTime,
+      ...(durationDays ? { durationDays, startDate } : {}),
+    };
+    const updatedReminders = editingCustomIndex === null
+      ? [...customReminders, reminder]
+      : customReminders.map((item, index) =>
+          index === editingCustomIndex ? reminder : item
+        );
+
+    await saveDatedReminderList(
+      updatedReminders,
+      CUSTOM_REMINDERS_KEY,
+      customRemindersEnabled,
+      cancelAllCustomNotifications,
+      getCustomNotificationIdentifier,
+      scheduleCustomNotification
+    );
+    setCustomReminders(updatedReminders);
+
+    if (editingCustomIndex === null) {
+      alert(t("reminders.routineAdded"));
+    }
+    resetCustomForm();
   }}
   style={{
     alignSelf: "center",
@@ -1405,7 +1949,9 @@ setAnniversaryReminders((prev) => [
       textAlign: "center",
     }}
   >
-    📝 Add Custom Reminder
+    {t(editingCustomIndex === null
+      ? "reminders.addRoutine"
+      : "reminders.updateRoutine")}
   </Text>
 </TouchableOpacity>
 {customReminders.length > 0 && (
@@ -1423,54 +1969,17 @@ setAnniversaryReminders((prev) => [
         { marginBottom: 12 },
       ]}
     >
-      Saved Custom Reminders
+      {t("reminders.savedRoutines")}
     </Text>
 
     {customReminders.map((reminder, index) => (
       <View
         key={`${reminder.name}-${reminder.day}-${reminder.month}-${index}`}
-        style={{
-          padding: 14,
-          marginBottom: 10,
-          borderRadius: 12,
-          borderWidth: 1,
-          borderColor: "#E0E0E0",
-          backgroundColor: "#F7F8FA",
-        }}
+        style={[styles.savedReminderCard, styles.savedReminderCardBordered]}
       >
-        <Text
-          style={{
-            fontSize: 17,
-            fontWeight: "700",
-          }}
-        >
+        <Text style={styles.savedCardTitle}>
           📝 {reminder.name}
         </Text>
-<TouchableOpacity
-  onPress={() => {
-    setCustomReminders((prev) =>
-      prev.filter((_, itemIndex) => itemIndex !== index)
-    );
-  }}
-  style={{
-    marginTop: 10,
-    alignSelf: "flex-start",
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    backgroundColor: "#E53935",
-  }}
->
-  <Text
-    style={{
-      fontSize: 14,
-      fontWeight: "700",
-      color: "#FFFFFF",
-    }}
-  >
-    Remove
-  </Text>
-</TouchableOpacity>
         <Text
           style={{
             marginTop: 5,
@@ -1489,6 +1998,66 @@ setAnniversaryReminders((prev) => [
         >
           ⏰ {reminder.time}
         </Text>
+        <Text style={styles.summaryText}>
+          {reminder.durationDays
+            ? t("reminders.durationSummary", {
+                count: reminder.durationDays,
+              })
+            : t("reminders.legacyRoutineHelp")}
+        </Text>
+        <View style={styles.savedCardActions}>
+          <TouchableOpacity
+            style={styles.editActionButton}
+            onPress={() => {
+              setEditingCustomIndex(index);
+              setCustomReminderName(reminder.name);
+              setCustomReminderDay(String(reminder.day));
+              setCustomReminderMonth(String(reminder.month));
+              setCustomReminderTime(reminder.time);
+              setRoutineDurationChoice(
+                reminder.durationDays
+                  ? getDurationChoice(reminder.durationDays)
+                  : "legacy"
+              );
+              setRoutineCustomDurationDays(
+                getDurationChoice(reminder.durationDays) === "custom"
+                  ? String(reminder.durationDays)
+                  : ""
+              );
+              setRoutineStartDate(reminder.startDate);
+            }}
+          >
+            <Text style={styles.editActionText}>{t("common.edit")}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.removeActionButton}
+            onPress={async () => {
+              const updatedReminders = customReminders.filter(
+                (_, itemIndex) => itemIndex !== index
+              );
+
+              await cancelRemovedDatedReminderNotification(
+                reminder,
+                updatedReminders,
+                reminderModeEnabled && customRemindersEnabled,
+                cancelCustomNotification,
+                getCustomNotificationIdentifier,
+                scheduleCustomNotification
+              );
+              await AsyncStorage.setItem(
+                CUSTOM_REMINDERS_KEY,
+                JSON.stringify(updatedReminders)
+              );
+              setCustomReminders(updatedReminders);
+              if (editingCustomIndex === index) resetCustomForm();
+              else if (editingCustomIndex !== null && editingCustomIndex > index) {
+                setEditingCustomIndex(editingCustomIndex - 1);
+              }
+            }}
+          >
+            <Text style={styles.removeActionText}>{t("common.remove")}</Text>
+          </TouchableOpacity>
+        </View>
       </View>
     ))}
   </View>
@@ -1498,496 +2067,180 @@ setAnniversaryReminders((prev) => [
 
 {reminderCategory === "medicine" && (
   <>
+   <CategoryReminderSwitch
+    label={t("reminders.enableMedicineReminders")}
+    value={medicineRemindersEnabled}
+    onValueChange={(value) => {
+     void toggleCategoryReminders("medicine", value);
+    }}
+  />
+  {editingMedicineIndex !== null
+    ? renderEditingControls(resetMedicineForm)
+    : null}
    <Text style={styles.label}>
-  Health Reminder Type
+  {t("reminders.healthType")}
 </Text>
 
-<View
-  style={{
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-    marginBottom: 12,
-  }}
->
-  <TouchableOpacity
-  onPress={() => setHealthReminderType("tablet")}
-  style={{
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      healthReminderType === "tablet"
-        ? "#dff3ff"
-        : "transparent",
-  }}
->
-  <Text>💊 Tablet</Text>
-</TouchableOpacity>
+<View style={styles.medicineTypeOptions}>
+  {MEDICINE_TYPE_OPTIONS.map((option) => {
+    const selected = healthReminderType === option.value;
+    const label = removeLeadingMedicineTypeIcon(
+      t(option.labelKey),
+      option.icon
+    );
 
-  <TouchableOpacity
-  onPress={() => setHealthReminderType("cream")}
-  style={{
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      healthReminderType === "cream"
-        ? "#dff3ff"
-        : "transparent",
-  }}
->
-  <Text>🧴 Cream</Text>
-</TouchableOpacity>
-
-  <TouchableOpacity
-  onPress={() => setHealthReminderType("drops")}
-  style={{
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      healthReminderType === "drops"
-        ? "#dff3ff"
-        : "transparent",
-  }}
->
-  <Text>💧 Drops</Text>
-</TouchableOpacity>
-
-  <TouchableOpacity
-  onPress={() => setHealthReminderType("injection")}
-  style={{
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      healthReminderType === "injection"
-        ? "#dff3ff"
-        : "transparent",
-  }}
->
-  <Text>💉 Injection</Text>
-</TouchableOpacity>
-
-  <TouchableOpacity
-  onPress={() => setHealthReminderType("other")}
-  style={{
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor:
-      healthReminderType === "other"
-        ? "#dff3ff"
-        : "transparent",
-  }}
->
-  <Text>🩹 Other</Text>
-</TouchableOpacity>
+    return (
+      <TouchableOpacity
+        key={option.value}
+        accessibilityRole="button"
+        accessibilityState={{ selected }}
+        onPress={() => setHealthReminderType(option.value)}
+        style={[
+          styles.medicineTypeOption,
+          selected && styles.medicineTypeOptionSelected,
+        ]}
+      >
+        <Text style={styles.medicineTypeOptionIcon}>{option.icon}</Text>
+        <Text
+          style={styles.medicineTypeOptionLabel}
+          maxFontSizeMultiplier={1.3}
+        >
+          {label}
+        </Text>
+      </TouchableOpacity>
+    );
+  })}
 </View>
     <Text style={styles.label}>
-      Medicine Name
+      {t("reminders.medicineName")}
     </Text>
 
     <TextInput
   style={styles.input}
   value={newMedicineName}
   onChangeText={setNewMedicineName}
-  placeholder="e.g. Vitamin D, BP Medicine"
+  placeholder={t("reminders.medicineExample")}
 />
 
 <Text style={styles.label}>
-  Reminder Time
+  {t("reminders.reminderTime")}
 </Text>
 
-<View
-  style={{
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-    marginBottom: 12,
-  }}
->
- {newMedicineTimes.map((time, index) => (
-  <View
-    key={index}
-    style={{
-      flexDirection: "row",
-      alignItems: "center",
-      marginRight: 10,
-      marginBottom: 6,
-    }}
-  >
-    <Text style={styles.summaryText}>
-      ⏰ {formatHealthTime(time)}
-    </Text>
-
-    <TouchableOpacity
-      onPress={() => {
-        setNewMedicineTimes(
-          newMedicineTimes.filter((_, i) => i !== index)
-        );
-      }}
-      style={{ marginLeft: 6 }}
-    >
-      <Text>❌</Text>
-    </TouchableOpacity>
-  </View>
-))}
-</View>
 <TouchableOpacity
-  onPress={() => {
-    const time = newMedicineTime.trim();
-
-    if (!time) {
-      return;
-    }
-
-    setNewMedicineTimes([
-      ...newMedicineTimes,
-      time,
-    ]);
-  }}
->
-  <Text>+ Add Time</Text>
-</TouchableOpacity>
-<TouchableOpacity
-  style={styles.input}
+  style={styles.addTimeButton}
   onPress={() => setShowMedicineTimePicker(true)}
 >
-  <Text>
-    ⏰ {medicinePickerHour}:
-    {medicinePickerMinute.toString().padStart(2, "0")}{" "}
-    {medicinePickerPeriod}
+  <Text style={styles.addTimeButtonText}>
+    + {t("reminders.addTime")}
   </Text>
 </TouchableOpacity>
-{showMedicineTimePicker && (
-  <View
-    style={{
-      marginTop: 10,
-      marginBottom: 12,
-      padding: 16,
-      borderWidth: 1,
-      borderRadius: 16,
-    }}
-  >
-    <Text
-      style={[
-        styles.label,
-        {
-          fontSize: 24,
-          fontWeight: "700",
-          textAlign: "center",
-          marginBottom: 14,
-        },
-      ]}
-    >
-      Select Reminder Time
-    </Text>
-
-    <Text
-      style={{
-        fontSize: 32,
-        fontWeight: "700",
-        textAlign: "center",
-        marginBottom: 18,
-      }}
-    >
-      ⏰ {medicinePickerHour}:
-      {medicinePickerMinute.toString().padStart(2, "0")}{" "}
-      {medicinePickerPeriod}
-    </Text>
-
-    <Text
-      style={{
-        fontSize: 20,
-        fontWeight: "600",
-        textAlign: "center",
-        marginBottom: 8,
-      }}
-    >
-      Hour
-    </Text>
-
-    <View
-      style={{
-        flexDirection: "row",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: 24,
-        marginBottom: 18,
-      }}
-    >
-      <TouchableOpacity
-        onPress={() =>
-          setMedicinePickerHour((prev) =>
-            prev === 1 ? 12 : prev - 1
-          )
-        }
-        style={{
-          width: 64,
-          height: 56,
-          borderWidth: 1,
-          borderRadius: 14,
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        <Text style={{ fontSize: 32, fontWeight: "700" }}>
-          −
-        </Text>
-      </TouchableOpacity>
-
-      <Text
-        style={{
-          fontSize: 36,
-          fontWeight: "700",
-          minWidth: 60,
-          textAlign: "center",
-        }}
-      >
-        {medicinePickerHour}
-      </Text>
-
-      <TouchableOpacity
-        onPress={() =>
-          setMedicinePickerHour((prev) =>
-            prev === 12 ? 1 : prev + 1
-          )
-        }
-        style={{
-          width: 64,
-          height: 56,
-          borderWidth: 1,
-          borderRadius: 14,
-          alignItems: "center",
-          justifyContent: "center",
-        }}
-      >
-        <Text style={{ fontSize: 32, fontWeight: "700" }}>
-          +
-        </Text>
-      </TouchableOpacity>
-    </View>
-
-    <Text
-      style={{
-        fontSize: 20,
-        fontWeight: "600",
-        textAlign: "center",
-        marginBottom: 10,
-      }}
-    >
-      Minutes
-    </Text>
-
-    <View
-      style={{
-        flexDirection: "row",
-        justifyContent: "center",
-        flexWrap: "wrap",
-        gap: 12,
-        marginBottom: 18,
-      }}
-    >
-      {[0, 10, 20, 30, 40, 50].map((minute) => (
-        <TouchableOpacity
-          key={minute}
-          onPress={() => setMedicinePickerMinute(minute)}
-          style={{
-           width: 54,
-height: 42,
-margin: 4,
-            borderWidth: 1,
-            borderRadius: 12,
-            alignItems: "center",
-            justifyContent: "center",
-            backgroundColor:
-              medicinePickerMinute === minute
-                ? "#dff3ff"
-                : "transparent",
-          }}
-        >
-          <Text
-            style={{
-              fontSize: 18,
-              fontWeight: "600",
+{newMedicineTimes.length > 0 ? (
+  <View style={styles.selectedTimesList}>
+    {newMedicineTimes.map((time, index) => (
+      <View key={`${time}-${index}`} style={styles.selectedTimeRow}>
+        <View style={styles.selectedTimeContent}>
+          <Text style={styles.selectedTimeIcon}>⏰</Text>
+          <Text style={styles.selectedTimeText}>
+            {formatHealthTime(time)}
+          </Text>
+        </View>
+        <View style={styles.selectedTimeActions}>
+          <TouchableOpacity
+            style={styles.selectedTimeEditButton}
+            onPress={() => {
+              setEditingMedicineTimeIndex(index);
+              setNewMedicineTime(time);
+              setShowMedicineTimePicker(true);
             }}
           >
-            {minute.toString().padStart(2, "0")}
-          </Text>
-        </TouchableOpacity>
-      ))}
-    </View>
-
-    <Text
-      style={{
-        fontSize: 20,
-        fontWeight: "600",
-        textAlign: "center",
-        marginBottom: 10,
-      }}
-    >
-      AM / PM
-    </Text>
-
-    <View
-      style={{
-        flexDirection: "row",
-        justifyContent: "center",
-        gap: 16,
-        marginBottom: 18,
-      }}
-    >
-      <TouchableOpacity
-        onPress={() => setMedicinePickerPeriod("AM")}
-        style={{
-          flex: 1,
-          height: 56,
-          borderWidth: 1,
-          borderRadius: 14,
-          alignItems: "center",
-          justifyContent: "center",
-          backgroundColor:
-            medicinePickerPeriod === "AM"
-              ? "#dff3ff"
-              : "transparent",
-        }}
-      >
-        <Text style={{ fontSize: 22, fontWeight: "700" }}>
-          AM
-        </Text>
-      </TouchableOpacity>
-
-      <TouchableOpacity
-        onPress={() => setMedicinePickerPeriod("PM")}
-        style={{
-          flex: 1,
-          height: 56,
-          borderWidth: 1,
-          borderRadius: 14,
-          alignItems: "center",
-          justifyContent: "center",
-          backgroundColor:
-            medicinePickerPeriod === "PM"
-              ? "#dff3ff"
-              : "transparent",
-        }}
-      >
-        <Text style={{ fontSize: 22, fontWeight: "700" }}>
-          PM
-        </Text>
-      </TouchableOpacity>
-    </View>
-
-    <View
-      style={{
-        flexDirection: "row",
-        gap: 12,
-      }}
-    >
-      <TouchableOpacity
-        onPress={() => setShowMedicineTimePicker(false)}
-        style={{
-          flex: 1,
-          minHeight: 58,
-          borderWidth: 1,
-          borderRadius: 14,
-          alignItems: "center",
-          justifyContent: "center",
-          paddingHorizontal: 8,
-        }}
-      >
-        <Text
-          style={{
-            fontSize: 18,
-            fontWeight: "600",
-            textAlign: "center",
-          }}
-        >
-          ✕ Cancel
-        </Text>
-      </TouchableOpacity>
-
-      <TouchableOpacity
-        onPress={() => {
-          let hour24 = medicinePickerHour;
-
-          if (
-            medicinePickerPeriod === "PM" &&
-            hour24 !== 12
-          ) {
-            hour24 += 12;
-          }
-
-          if (
-            medicinePickerPeriod === "AM" &&
-            hour24 === 12
-          ) {
-            hour24 = 0;
-          }
-
-          const formattedTime =
-            `${hour24.toString().padStart(2, "0")}:` +
-            `${medicinePickerMinute
-              .toString()
-              .padStart(2, "0")}`;
-
-          setNewMedicineTime(formattedTime);
-          setNewMedicineTimes((prev) =>
-  prev.includes(formattedTime)
-    ? prev
-    : [...prev, formattedTime]
-);
-          setShowMedicineTimePicker(false);
-        }}
-        style={{
-          flex: 1.4,
-          minHeight: 58,
-          borderWidth: 1,
-          borderRadius: 14,
-          alignItems: "center",
-          justifyContent: "center",
-          paddingHorizontal: 8,
-        }}
-      >
-        <Text
-          style={{
-            fontSize: 18,
-            fontWeight: "700",
-            textAlign: "center",
-          }}
-        >
-          ✓ Use This Time
-        </Text>
-      </TouchableOpacity>
-    </View>
+            <Text style={styles.selectedTimeEditText}>{t("common.edit")}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.selectedTimeRemoveButton}
+            onPress={() => {
+              setNewMedicineTimes(
+                newMedicineTimes.filter((_, itemIndex) => itemIndex !== index)
+              );
+              if (editingMedicineTimeIndex === index) {
+                setEditingMedicineTimeIndex(null);
+              }
+            }}
+          >
+            <Text style={styles.selectedTimeRemoveText}>
+              {t("common.remove")}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    ))}
   </View>
-)}
+) : null}
+<CompactTimePicker
+  visible={showMedicineTimePicker}
+  value={newMedicineTime}
+  onCancel={() => {
+    setEditingMedicineTimeIndex(null);
+    setShowMedicineTimePicker(false);
+  }}
+  onDone={(time) => {
+    setNewMedicineTime(time);
+    setNewMedicineTimes((previousTimes) => {
+      const nextTimes = editingMedicineTimeIndex === null
+        ? [...previousTimes, time]
+        : previousTimes.map((item, index) =>
+            index === editingMedicineTimeIndex ? time : item
+          );
+      return Array.from(new Set(nextTimes));
+    });
+    setEditingMedicineTimeIndex(null);
+    setShowMedicineTimePicker(false);
+  }}
+/>
+
+<DurationSelector
+  label={t("reminders.duration")}
+  choice={medicineDurationChoice}
+  includeOngoing
+  customLabel={t("reminders.customDuration")}
+  ongoingLabel={t("reminders.ongoing")}
+  dayLabel={(days) =>
+    t(
+      days === 1
+        ? "reminders.oneDay"
+        : days === 3
+          ? "reminders.threeDays"
+          : days === 5
+            ? "reminders.fiveDays"
+            : "reminders.sevenDays"
+    )
+  }
+  onChange={(choice) => {
+    setMedicineDurationChoice(choice);
+    if (choice !== "custom") setMedicineCustomDurationDays("");
+    if (choice !== "ongoing" && !medicineStartDate) {
+      setMedicineStartDate(getLocalDateKey(new Date()));
+    }
+  }}
+/>
+{medicineDurationChoice === "custom" ? (
+  <TextInput
+    style={styles.input}
+    value={medicineCustomDurationDays}
+    onChangeText={setMedicineCustomDurationDays}
+    placeholder={t("reminders.durationDaysPlaceholder")}
+    keyboardType="number-pad"
+  />
+) : null}
+{medicineDurationChoice === "ongoing" ? (
+  <Text style={styles.durationHelp}>{t("reminders.ongoingHelp")}</Text>
+) : null}
 
  {healthReminders.map((reminder, index) => (
   <View
     key={index}
-    style={{
-      marginTop: 10,
-      padding: 10,
-      borderWidth: 1,
-      borderRadius: 10,
-    }}
+    style={[styles.savedReminderCard, styles.savedMedicineCard]}
   >
-    <View
-      style={{
-        flexDirection: "row",
-        alignItems: "center",
-        justifyContent: "space-between",
-      }}
-    >
-      <Text style={styles.summaryText}>
+      <Text style={styles.savedCardTitle}>
         {reminder.type === "tablet"
           ? "💊"
           : reminder.type === "cream"
@@ -2000,24 +2253,68 @@ margin: 4,
         {reminder.name}
       </Text>
 
-      <TouchableOpacity
-        onPress={() => {
-          setHealthReminders(
-            healthReminders.filter((_, i) => i !== index)
-          );
-        }}
-      >
-        <Text>❌ Remove</Text>
-      </TouchableOpacity>
-    </View>
-
     <Text style={styles.summaryText}>
-  ⏰ {reminder.times.length} time{reminder.times.length > 1 ? "s" : ""} daily
+  {t("reminders.timesDaily", {
+    count: reminder.times.length,
+    times: t(reminder.times.length === 1 ? "reminders.time" : "reminders.times"),
+  })}
 </Text>
 
 <Text style={styles.summaryText}>
   {reminder.times.map(formatHealthTime).join(" • ")}
 </Text>
+<Text style={styles.summaryText}>
+  {reminder.durationDays
+    ? t("reminders.durationSummary", { count: reminder.durationDays })
+    : t("reminders.ongoing")}
+</Text>
+    <View style={styles.savedCardActions}>
+      <TouchableOpacity
+        style={styles.editActionButton}
+        onPress={() => {
+          setEditingMedicineIndex(index);
+          setEditingMedicineTimeIndex(null);
+          setNewMedicineName(reminder.name);
+          setHealthReminderType(reminder.type);
+          setNewMedicineTimes([...reminder.times]);
+          setNewMedicineTime(reminder.times[0] ?? "09:00");
+          setMedicineDurationChoice(getDurationChoice(reminder.durationDays));
+          setMedicineCustomDurationDays(
+            getDurationChoice(reminder.durationDays) === "custom"
+              ? String(reminder.durationDays)
+              : ""
+          );
+          setMedicineStartDate(reminder.startDate);
+        }}
+      >
+        <Text style={styles.editActionText}>{t("common.edit")}</Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={styles.removeActionButton}
+        onPress={async () => {
+          const updatedReminders = healthReminders.filter(
+            (_, i) => i !== index
+          );
+
+          await cancelAllMedicineNotifications();
+          await AsyncStorage.setItem(
+            HEALTH_REMINDERS_KEY,
+            JSON.stringify(updatedReminders)
+          );
+          setHealthReminders(updatedReminders);
+
+          if (reminderModeEnabled && medicineRemindersEnabled) {
+            await scheduleMedicineNotifications(updatedReminders);
+          }
+          if (editingMedicineIndex === index) resetMedicineForm();
+          else if (editingMedicineIndex !== null && editingMedicineIndex > index) {
+            setEditingMedicineIndex(editingMedicineIndex - 1);
+          }
+        }}
+      >
+        <Text style={styles.removeActionText}>{t("common.remove")}</Text>
+      </TouchableOpacity>
+    </View>
   </View>
 ))}
 </>
@@ -2026,36 +2323,53 @@ margin: 4,
 <TouchableOpacity
     onPress={async () => {
       if (!newMedicineName.trim()) {
-        alert("Please enter medicine name");
+        alert(t("reminders.enterMedicineName"));
         return;
       }
 
-      if (!newMedicineTime) {
-        alert("Please add reminder time");
+      if (newMedicineTimes.length === 0) {
+        alert(t("reminders.addReminderTime"));
         return;
       }
 
-      setHealthReminders((prev) => [
-        ...prev,
-        {
-          name: newMedicineName.trim(),
-          type: healthReminderType,
-          times: newMedicineTimes,
-        },
-      ]);
-for (const time of newMedicineTimes) {
-  const [medicineHour24, medicineMinute24] =
-    time.split(":").map(Number);
+      const durationDays = resolveDurationDays(
+        medicineDurationChoice,
+        medicineCustomDurationDays
+      );
 
-  await scheduleMedicineNotification(
-    newMedicineName.trim(),
-    medicineHour24,
-    medicineMinute24
-  );
-}
-      setNewMedicineName("");
-      setNewMedicineTime("");
-      setNewMedicineTimes([]);
+      if (durationDays === null) {
+        alert(t("reminders.invalidDuration"));
+        return;
+      }
+
+      const reminder: HealthReminder = {
+        name: newMedicineName.trim(),
+        type: healthReminderType,
+        times: newMedicineTimes,
+        ...(durationDays
+          ? {
+              durationDays,
+              startDate: medicineStartDate ?? getLocalDateKey(new Date()),
+            }
+          : {}),
+      };
+      const updatedReminders = editingMedicineIndex === null
+        ? [...healthReminders, reminder]
+        : healthReminders.map((item, index) =>
+            index === editingMedicineIndex ? reminder : item
+          );
+
+      await cancelAllMedicineNotifications();
+      await AsyncStorage.setItem(
+        HEALTH_REMINDERS_KEY,
+        JSON.stringify(updatedReminders)
+      );
+      setHealthReminders(updatedReminders);
+
+      if (reminderModeEnabled && medicineRemindersEnabled) {
+        await scheduleMedicineNotifications(updatedReminders);
+      }
+      resetMedicineForm();
     }}
     style={{
      marginTop: 12,
@@ -2075,55 +2389,22 @@ for (const time of newMedicineTimes) {
         textAlign: "center",
       }}
     >
-      💊 Add Medicine
+      {t(editingMedicineIndex === null
+        ? "reminders.addMedicine"
+        : "reminders.updateMedicine")}
     </Text>
   </TouchableOpacity>
   ) : null}
 
-<View
-  style={{
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginTop: 16,
-    marginBottom: 10,
-  }}
->
-  <View>
-    <Text style={styles.label}>
-      Reminder Mode
-    </Text>
-
-    <Text
-      style={{
-        fontSize: 14,
-        marginTop: 2,
+{reminderCategory === "water" ? (
+  <>
+    <CategoryReminderSwitch
+      label={t("reminders.enableWaterReminders")}
+      value={remindersEnabled}
+      onValueChange={(value) => {
+        void toggleCategoryReminders("water", value);
       }}
-    >
-      {reminderModeEnabled ? "Reminders ON" : "Reminders OFF"}
-    </Text>
-  </View>
-
-<Switch
-  value={reminderModeEnabled}
-  onValueChange={async (value) => {
-    setReminderModeEnabled(value);
-    await AsyncStorage.setItem(
-  "REMINDER_MODE_ENABLED",
-  JSON.stringify(value)
-);
-
-    if (!value) {
-      await cancelAllHydroMateReminders();
-      alert("All reminders are turned OFF");
-      return;
-    }
-
-    await restoreSavedReminders();
-    alert("Saved reminders are turned ON");
-  }}
-/>
-</View>
+    />
 <View
   style={[
     styles.statusBox,
@@ -2134,8 +2415,8 @@ for (const time of newMedicineTimes) {
 >
   <Text style={styles.statusText}>
     {remindersEnabled
-      ? "✅ Reminders ON"
-      : "⛔ Reminders OFF"}
+      ? t("reminders.statusOn")
+      : t("reminders.statusOff")}
   </Text>
 </View>
 <View style={styles.modeRow}>
@@ -2152,7 +2433,7 @@ for (const time of newMedicineTimes) {
         reminderMode === "smart" && styles.modeButtonTextActive,
       ]}
     >
-      ⭐ Smart Schedule
+      {t("reminders.smartSchedule")}
     </Text>
   </TouchableOpacity>
 
@@ -2169,12 +2450,12 @@ for (const time of newMedicineTimes) {
         reminderMode === "fixed" && styles.modeButtonTextActive,
       ]}
     >
-      ⏰ Fixed Interval
+      {t("reminders.fixedInterval")}
     </Text>
   </TouchableOpacity>
 </View>
         <Text style={styles.label}>
-          Daily Water Goal (ml)
+          {t("reminders.dailyGoal")}
         </Text>
 
         <TextInput
@@ -2186,7 +2467,7 @@ for (const time of newMedicineTimes) {
         />
 
         <Text style={styles.label}>
-          Amount per Reminder (ml)
+          {t("reminders.amountPerReminder")}
         </Text>
 
         <TextInput
@@ -2200,7 +2481,7 @@ for (const time of newMedicineTimes) {
         {reminderMode === "fixed" && (
   <>
     <Text style={styles.label}>
-     Reminder Interval (minutes)
+     {t("reminders.intervalMinutes")}
     </Text>
 
     <TextInput
@@ -2214,169 +2495,131 @@ for (const time of newMedicineTimes) {
 )}
 
         <Text style={styles.label}>
-  Start Hour
+  {t("reminders.startHour")}
 </Text>
 
 <TouchableOpacity
   style={[styles.input, styles.timeSelector]}
-  onPress={() =>
-    setShowStartPicker(!showStartPicker)
-  }
+  onPress={() => setShowStartPicker(true)}
 >
   <Text style={styles.timeSelectorText}>
-    {Number(startHour) < 12
-      ? `${Number(startHour) || 12}:00 AM`
-      : `${Number(startHour) === 12 ? 12 : Number(startHour) - 12}:00 PM`}
+    {formatMinutesOfDay(getStartMinutes())}
   </Text>
 
   <Text style={styles.timeArrow}>
     ▼
   </Text>
 </TouchableOpacity>
-{showStartPicker && (
-  <ScrollView
-  style={styles.pickerBox}
-  nestedScrollEnabled={true}
->
-    {[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22].map(
-      (hour) => (
-        <TouchableOpacity
-          key={hour}
-          style={styles.pickerOption}
-         onPress={() => {
-  setStartHour(String(hour));
+<CompactTimePicker
+  visible={showStartPicker}
+  value={`${String(startHour).padStart(2, "0")}:${String(
+    startMinute
+  ).padStart(2, "0")}`}
+  onCancel={() => setShowStartPicker(false)}
+  onDone={(time) => {
+    const [hour, minute] = time.split(":").map(Number);
+    const selectedStart = hour * 60 + minute;
 
-  if (Number(endHour) <= hour) {
-    setEndHour(String(Math.min(hour + 1, 23)));
-  }
+    setStartHour(String(hour));
+    setStartMinute(String(minute));
 
-  setShowStartPicker(false);
-}}
-        >
-          <Text style={styles.pickerOptionText}>
-  {hour < 12
-    ? `${hour}:00 AM`
-    : `${hour === 12 ? 12 : hour - 12}:00 PM`}
-</Text>
-        </TouchableOpacity>
-      )
-    )}
-    </ScrollView>
-)}
+    if (getEndMinutes() <= selectedStart) {
+      const adjustedEnd = Math.min(selectedStart + 60, 23 * 60 + 59);
+      setEndHour(String(Math.floor(adjustedEnd / 60)));
+      setEndMinute(String(adjustedEnd % 60));
+    }
+
+    setShowStartPicker(false);
+  }}
+/>
         
 
         <Text style={styles.label}>
-  End Hour
+  {t("reminders.endHour")}
 </Text>
 
 <TouchableOpacity
   style={[styles.input, styles.timeSelector]}
-  onPress={() =>
-    setShowEndPicker(!showEndPicker)
-  }
+  onPress={() => setShowEndPicker(true)}
 >
   <Text style={styles.timeSelectorText}>
-    {Number(endHour) < 12
-      ? `${Number(endHour) || 12}:00 AM`
-      : `${Number(endHour) === 12 ? 12 : Number(endHour) - 12}:00 PM`}
+    {formatMinutesOfDay(getEndMinutes())}
   </Text>
 
   <Text style={styles.timeArrow}>
     ▼
   </Text>
 </TouchableOpacity>
-{showEndPicker && (
-  <ScrollView
-    style={styles.pickerBox}
-    nestedScrollEnabled={true}
-  >
-    {[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23].map(
-      (hour) => (
-        <TouchableOpacity
-  key={hour}
-  style={[
-    styles.pickerOption,
-    hour <= Number(startHour) &&
-      styles.pickerOptionDisabled,
-  ]}
-  disabled={hour <= Number(startHour)}
-  onPress={() => {
+<CompactTimePicker
+  visible={showEndPicker}
+  value={`${String(endHour).padStart(2, "0")}:${String(
+    endMinute
+  ).padStart(2, "0")}`}
+  onCancel={() => setShowEndPicker(false)}
+  onDone={(time) => {
+    const [hour, minute] = time.split(":").map(Number);
     setEndHour(String(hour));
+    setEndMinute(String(minute));
     setShowEndPicker(false);
   }}
->
-          <Text style={styles.pickerOptionText}>
-            {hour < 12
-              ? `${hour}:00 AM`
-              : `${hour === 12 ? 12 : hour - 12}:00 PM`}
-          </Text>
-        </TouchableOpacity>
-      )
-    )}
-  </ScrollView>
-)}
-  {Number(endHour) <= Number(startHour) && (
+/>
+  {getEndMinutes() <= getStartMinutes() && (
   <Text style={styles.warningText}>
-    ⚠️ End time must be later than start time.
+    ⚠️ {t("reminders.endAfterStart")}
   </Text>
 )}
 <View style={styles.summaryBox}>
   <Text style={styles.summaryTitle}>
-    Reminder Summary
+    {t("reminders.summary")}
   </Text>
 
   <Text style={styles.summaryText}>
-    Mode: {reminderMode === "smart"
-      ? "Smart Schedule"
-      : "Fixed Interval"}
+    {t("reminders.summaryMode", {
+      mode: t(reminderMode === "smart"
+        ? "reminders.smartSchedulePlain"
+        : "reminders.fixedIntervalPlain"),
+    })}
   </Text>
 
   <Text style={styles.summaryText}>
-    Daily Goal: {dailyGoal} ml
+    {t("reminders.summaryGoal", { amount: dailyGoal })}
   </Text>
 
   <Text style={styles.summaryText}>
-    Amount per Reminder: {amount} ml
+    {t("reminders.summaryAmount", { amount })}
   </Text>
 
   <Text style={styles.summaryText}>
-  Time:{" "}
-  {Number(startHour) < 12
-    ? `${Number(startHour) || 12}:00 AM`
-    : `${Number(startHour) === 12 ? 12 : Number(startHour) - 12}:00 PM`}
-  {" - "}
-  {Number(endHour) < 12
-    ? `${Number(endHour) || 12}:00 AM`
-    : `${Number(endHour) === 12 ? 12 : Number(endHour) - 12}:00 PM`}
+  {t("reminders.summaryTime", {
+    start: formatMinutesOfDay(getStartMinutes()),
+    end: formatMinutesOfDay(getEndMinutes()),
+  })}
 </Text>
     {reminderMode === "smart" && (
     <Text style={styles.smartInfoText}>
-    ⭐ HydroMate will automatically spread your reminders
-    across this time window to help meet your daily goal.
+    {t("reminders.smartInfo")}
     </Text>
 )}
     {reminderMode === "smart" && (
   <Text style={styles.summaryText}>
-    Planned Reminders: {
+    {t("reminders.planned", { count:
       Number(amount) > 0
         ? Math.ceil(
             Number(dailyGoal) / Number(amount)
           )
-        : 0
-    }
+        : 0 })}
   </Text>
 )}
 {reminderMode === "smart" && (
   <Text style={styles.summaryText}>
-    Schedule: {getSmartScheduleTimes().join(" • ")}
+    {t("reminders.schedule", { times: getSmartScheduleTimes().join(" • ") })}
   </Text>
 )}
 {reminderMode === "smart" && (
   <Text style={styles.summaryText}>
-    Next Reminder:{" "}
-    {getNextSmartReminderMinutes() !== null
+    {t("reminders.next", { time: getNextSmartReminderMinutes() !== null
       ? formatMinutesOfDay(getNextSmartReminderMinutes()!)
-      : "Not available"}
+      : t("common.notAvailable") })}
   </Text>
 
 )}
@@ -2384,101 +2627,81 @@ for (const time of newMedicineTimes) {
   {reminderMode === "fixed" && (
   <>
     <Text style={styles.summaryText}>
-      Interval: Every {interval} minute(s)
+      {t("reminders.interval", { minutes: interval })}
     </Text>
 <Text style={styles.summaryText}>
-  Planned Reminders: {
-    Number(interval) > 0
-      ? Math.floor(
-         ((Number(endHour) - Number(startHour)) * 60) /
-          Number(interval)
-        ) + 1
-      : 0
-  }
+  {t("reminders.planned", {
+    count: getFixedScheduleTimes().length,
+  })}
 </Text>
 {reminderMode === "fixed" && (
   <Text style={[styles.summaryText, { fontWeight: "700" }]}>
-    Next Reminder:{" "}
-  {getNextFixedReminderMinutes() !== null
+    {t("reminders.next", { time: getNextFixedReminderMinutes() !== null
   ? formatMinutesOfDay(getNextFixedReminderMinutes()!)
-  : "Not available"}
+  : t("common.notAvailable") })}
   </Text>
 )}
 {reminderMode === "fixed" && (
   <Text style={styles.summaryText}>
-   Today's Schedule: {getFixedScheduleTimes().join(" • ")}
+   {t("reminders.todaysSchedule", { times: getFixedScheduleTimes().join(" • ") })}
   </Text>
 )}
 {reminderMode === "fixed" && (
   <Text style={styles.summaryText}>
-    Remaining Today: {getRemainingFixedReminders()} reminder(s)
+    {t("reminders.remaining", { count: getRemainingFixedReminders() })}
   </Text>
 )}
     <Text style={styles.summaryText}>
-  Planned Water:{" "}
-  {getFixedScheduleTimes().length * Number(amount)} ml
+  {t("reminders.plannedWater", {
+    amount: getFixedScheduleTimes().length * Number(amount),
+  })}
 </Text>
 
   {getFixedScheduleTimes().length * Number(amount) === Number(dailyGoal) ? (
   <Text style={styles.summaryText}>
-    🎯 Perfect Match! Your schedule gives you exactly{" "}
-    {Number(dailyGoal)} ml — right on target.
+    {t("reminders.perfectMatch", { amount: Number(dailyGoal) })}
   </Text>
 ) : getFixedScheduleTimes().length * Number(amount) > Number(dailyGoal) ? (
   <>
     <Text style={styles.summaryText}>
-      🎉 Goal Covered! Your plan gives you{" "}
-      {getFixedScheduleTimes().length * Number(amount)} ml, which meets your{" "}
-      {Number(dailyGoal)} ml daily goal.
+      {t("reminders.goalCovered", {
+        planned: getFixedScheduleTimes().length * Number(amount),
+        goal: Number(dailyGoal),
+      })}
     </Text>
 
     <Text style={styles.summaryText}>
-      💧 You’re{" "}
-      {getFixedScheduleTimes().length * Number(amount) - Number(dailyGoal)} ml
-      above your goal — you can keep this plan or slightly increase the interval.
+      {t("reminders.aboveGoal", {
+        amount: getFixedScheduleTimes().length * Number(amount) - Number(dailyGoal),
+      })}
     </Text>
   </>
 ) : (
   <Text style={styles.summaryText}>
-    💧 Hydration Check! Only{" "}
-    {getFixedScheduleTimes().length}{" "}
-    reminder(s) are planned, but you need{" "}
-    {Math.ceil(Number(dailyGoal) / Number(amount))}{" "}
-    to hit your goal. ⭐ Try Smart Schedule or shorten the interval!
+    {t("reminders.hydrationCheck", {
+      planned: getFixedScheduleTimes().length,
+      needed: Math.ceil(Number(dailyGoal) / Number(amount)),
+    })}
   </Text>
 )}
 
     {Number(interval) > 0 &&
-      (Math.floor(
-        (Number(endHour) - Number(startHour)) /
-          Number(interval)
-      ) +
-        1) *
-        Number(amount) ===
+      getFixedScheduleTimes().length * Number(amount) ===
         Number(dailyGoal) && (
         <Text style={styles.successText}>
-          ✅ This schedule meets your daily goal.
+          {t("reminders.meetsGoal")}
         </Text>
       )}
 
     {Number(interval) > 0 &&
-      (Math.floor(
-        (Number(endHour) - Number(startHour)) /
-          Number(interval)
-      ) +
-        1) *
-        Number(amount) >
+      getFixedScheduleTimes().length * Number(amount) >
         Number(dailyGoal) && (
         <Text style={styles.warningText}>
-          ⚠️ This schedule exceeds your daily goal by{" "}
-          {(Math.floor(
-            (Number(endHour) - Number(startHour)) /
-              Number(interval)
-          ) +
-            1) *
-            Number(amount) -
-            Number(dailyGoal)}{" "}
-          ml.
+          {t("reminders.exceedsGoal", {
+            amount:
+              getFixedScheduleTimes().length * Number(amount) -
+              Number(dailyGoal),
+          })}
         </Text>
       )}
   </>
@@ -2489,23 +2712,17 @@ for (const time of newMedicineTimes) {
         <TouchableOpacity
   style={[
   styles.button,
-  !remindersEnabled &&
-    !isFormValid &&
-    styles.buttonDisabled,
+  !isFormValid && styles.buttonDisabled,
 ]}
-  onPress={
-    remindersEnabled
-      ? disableReminders
-      : enableReminders
-     }
-      disabled={!remindersEnabled && !isFormValid} 
+  onPress={saveWaterSettings}
+  disabled={!isFormValid}
 >
   <Text style={styles.buttonText}>
-    {remindersEnabled
-      ? "🔕 Turn Off Water Reminders"
-      : "🔔 Enable Water Reminders"}
+    {t("reminders.saveWaterSettings")}
   </Text>
 </TouchableOpacity>
+  </>
+) : null}
 
         </View>
     </ScrollView>
@@ -2536,6 +2753,176 @@ const styles = StyleSheet.create({
     marginBottom: 25,
   },
 
+  categorySwitchRow: {
+    minHeight: 50,
+    marginBottom: 16,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: "#EAF6FF",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+
+  categorySwitchLabel: {
+    flex: 1,
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#12344D",
+  },
+
+  masterReminderRow: {
+    minHeight: 72,
+    marginBottom: 18,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: "#DFF3FF",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+
+  masterReminderText: {
+    flex: 1,
+  },
+
+  masterReminderSubtitle: {
+    color: "#456779",
+    fontSize: 13,
+  },
+
+  masterReminderState: {
+    marginTop: 3,
+    color: "#12344D",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+
+  editingBanner: {
+    marginBottom: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderWidth: 1,
+    borderColor: "#90CAF9",
+    borderRadius: 10,
+    backgroundColor: "#EAF6FF",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+
+  editingBannerText: {
+    flex: 1,
+    color: "#145A86",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+
+  cancelEditButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: "#FFFFFF",
+  },
+
+  cancelEditText: {
+    color: "#145A86",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+
+  savedReminderCard: {
+    width: "100%",
+    minWidth: 0,
+    marginBottom: 10,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 14,
+    borderRadius: 12,
+    backgroundColor: "#F5F7FA",
+    overflow: "hidden",
+  },
+
+  savedReminderCardBordered: {
+    borderWidth: 1,
+    borderColor: "#E0E0E0",
+    backgroundColor: "#F7F8FA",
+  },
+
+  savedMedicineCard: {
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: "#D5DDE3",
+    backgroundColor: "#FFFFFF",
+  },
+
+  savedCardTitle: {
+    width: "100%",
+    minWidth: 0,
+    flexShrink: 1,
+    color: "#1F2933",
+    fontSize: 17,
+    fontWeight: "700",
+    lineHeight: 23,
+  },
+
+  savedCardActions: {
+    width: "100%",
+    minWidth: 0,
+    marginTop: 14,
+    paddingTop: 2,
+    paddingBottom: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+
+  editActionButton: {
+    maxWidth: "100%",
+    minHeight: 40,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 1,
+    backgroundColor: "#E3F2FD",
+  },
+
+  editActionText: {
+    color: "#1565C0",
+    fontSize: 13,
+    fontWeight: "700",
+    textAlign: "center",
+    flexShrink: 1,
+  },
+
+  removeActionButton: {
+    maxWidth: "100%",
+    minHeight: 40,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 1,
+    backgroundColor: "#FDECEC",
+  },
+
+  removeActionText: {
+    color: "#C62828",
+    fontSize: 13,
+    fontWeight: "700",
+    textAlign: "center",
+    flexShrink: 1,
+  },
+
   label: {
     fontSize: 16,
     fontWeight: "600",
@@ -2551,6 +2938,238 @@ const styles = StyleSheet.create({
     fontSize: 16,
     borderWidth: 1,
     borderColor: "#D8EAF7",
+  },
+
+  addTimeButton: {
+    alignSelf: "flex-start",
+    minHeight: 40,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: "#2196F3",
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F7FCFF",
+  },
+
+  addTimeButtonText: {
+    color: "#1677A8",
+    fontSize: 15,
+    lineHeight: 20,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+
+  selectedTimesList: {
+    width: "100%",
+    marginTop: 8,
+    gap: 7,
+  },
+
+  selectedTimeRow: {
+    width: "100%",
+    minHeight: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderWidth: 1,
+    borderColor: "#D8EAF7",
+    borderRadius: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#FFFFFF",
+  },
+
+  selectedTimeContent: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: "row",
+    alignItems: "center",
+  },
+
+  selectedTimeActions: {
+    marginLeft: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+
+  selectedTimeEditButton: {
+    minHeight: 30,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#E3F2FD",
+  },
+
+  selectedTimeEditText: {
+    color: "#1565C0",
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: "600",
+  },
+
+  selectedTimeIcon: {
+    marginRight: 8,
+    fontSize: 16,
+    lineHeight: 22,
+    textAlignVertical: "center",
+  },
+
+  selectedTimeText: {
+    flexShrink: 1,
+    color: "#222222",
+    fontSize: 15,
+    lineHeight: 22,
+    fontWeight: "600",
+    textAlignVertical: "center",
+  },
+
+  selectedTimeRemoveButton: {
+    minHeight: 30,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#FDECEC",
+  },
+
+  selectedTimeRemoveText: {
+    color: "#C62828",
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: "600",
+    textAlign: "center",
+  },
+
+  reminderTypeButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    borderWidth: 1,
+    backgroundColor: "transparent",
+  },
+
+  reminderTypeButtonActive: {
+    backgroundColor: "#dff3ff",
+  },
+
+  reminderTypeIcon: {
+    fontSize: 16,
+    lineHeight: 22,
+  },
+
+  reminderTypeLabel: {
+    flexShrink: 0,
+    fontSize: 15,
+    lineHeight: 22,
+    color: "#222222",
+  },
+
+  medicineTypeOptions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "stretch",
+    gap: 10,
+    marginBottom: 12,
+  },
+
+  medicineTypeOption: {
+    flexBasis: "47%",
+    flexGrow: 1,
+    minWidth: 140,
+    minHeight: 72,
+    paddingHorizontal: 13,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#CBD5DC",
+    backgroundColor: "#FFFFFF",
+    flexDirection: "row",
+    alignItems: "center",
+  },
+
+  medicineTypeOptionSelected: {
+    borderColor: "#2196F3",
+    backgroundColor: "#DFF3FF",
+  },
+
+  medicineTypeOptionIcon: {
+    width: 28,
+    marginRight: 8,
+    fontSize: 19,
+    lineHeight: 26,
+    textAlign: "center",
+    textAlignVertical: "center",
+  },
+
+  medicineTypeOptionLabel: {
+    flex: 1,
+    flexShrink: 1,
+    color: "#222222",
+    fontSize: 15,
+    lineHeight: 24,
+    fontWeight: "600",
+    includeFontPadding: true,
+    textAlignVertical: "center",
+  },
+
+  durationSection: {
+    marginTop: 16,
+  },
+
+  durationOptions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 9,
+  },
+
+  durationOption: {
+    minHeight: 42,
+    minWidth: 92,
+    flexGrow: 1,
+    flexBasis: "29%",
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#CBD5DC",
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  durationOptionSelected: {
+    borderColor: "#2196F3",
+    backgroundColor: "#DFF3FF",
+  },
+
+  durationOptionText: {
+    color: "#344A57",
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: "600",
+    textAlign: "center",
+  },
+
+  durationOptionTextSelected: {
+    color: "#126AA4",
+    fontWeight: "800",
+  },
+
+  durationHelp: {
+    marginTop: 8,
+    marginBottom: 4,
+    color: "#667A86",
+    fontSize: 12,
+    lineHeight: 18,
   },
 
   button: {
@@ -2631,25 +3250,6 @@ successText: {
 scrollContent: {
   paddingBottom: 120,
 },
-pickerBox: {
-  borderWidth: 1,
-  borderColor: "#DDDDDD",
-  borderRadius: 10,
-  marginBottom: 12,
-  maxHeight: 180,
-  backgroundColor: "#FFFFFF",
-},
-
-pickerOption: {
-  paddingVertical: 12,
-  paddingHorizontal: 14,
-  borderBottomWidth: 1,
-  borderBottomColor: "#EEEEEE",
-},
-
-pickerOptionText: {
-  fontSize: 15,
-},
 timeSelector: {
   flexDirection: "row",
   alignItems: "center",
@@ -2665,9 +3265,6 @@ timeArrow: {
 },
 buttonDisabled: {
   opacity: 0.45,
-},
-pickerOptionDisabled: {
-  opacity: 0.35,
 },
 summaryBox: {
   marginTop: 16,
